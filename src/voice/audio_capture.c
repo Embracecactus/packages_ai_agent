@@ -29,17 +29,21 @@
 #include <aw-alsa-lib/pcm.h>
 #endif
 #include <errno.h>
+#include <poll.h>
 #include <media_recorder.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
+#include <time.h>
 #include <unistd.h>
 
 static const char* TAG = "audio_cap";
 
 #define CAP_OPTIONS_LEN 128
+#define CAP_CLOSE_RETRY_US (50 * 1000)
+#define CAP_CLOSE_TIMEOUT_MS 5000u
 #ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
 #define CAP_ALSA_NAME_DEFAULT "default"
 #endif
@@ -72,9 +76,74 @@ struct audio_capture {
     unsigned char* scratch;
     size_t scratch_size;
     int started;
+    int route_active;
+    int (*route)(int active);
 };
 
 static audio_capture_t* s_active_capture;
+static int (*s_route)(int active);
+
+int audio_capture_set_route(int (*route)(int active))
+{
+    if (s_active_capture) return -EBUSY;
+    s_route = route;
+    return 0;
+}
+
+static int64_t capture_now_ms(void)
+{
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static int close_media_recorder(audio_capture_t* cap, unsigned int timeout_ms)
+{
+    if (timeout_ms == 0) return -EINVAL;
+    int last_ret = -EIO;
+    int64_t deadline = capture_now_ms() + timeout_ms;
+
+    do {
+        int ret = media_recorder_close(cap->handle.recorder);
+        if (ret >= 0) {
+            cap->handle.recorder = NULL;
+            return 0;
+        }
+        last_ret = ret;
+        syslog(LOG_WARNING, "[%s] recorder close failed: %d; retrying release\n",
+            TAG, ret);
+        media_recorder_stop(cap->handle.recorder);
+        media_recorder_reset(cap->handle.recorder);
+        if (capture_now_ms() >= deadline) break;
+        usleep(CAP_CLOSE_RETRY_US);
+    } while (capture_now_ms() < deadline);
+
+    return last_ret;
+}
+
+static int release_capture_route(audio_capture_t* cap,
+    unsigned int timeout_ms)
+{
+    if (timeout_ms == 0) return -EINVAL;
+    int last_ret = -EIO;
+    int64_t deadline = capture_now_ms() + timeout_ms;
+
+    if (!cap->route_active || !cap->route) return 0;
+    do {
+        int ret = cap->route(0);
+        if (ret >= 0) {
+            cap->route_active = 0;
+            return 0;
+        }
+        last_ret = ret;
+        syslog(LOG_WARNING, "[%s] route release failed: %d; retrying\n",
+            TAG, ret);
+        if (capture_now_ms() >= deadline) break;
+        usleep(CAP_CLOSE_RETRY_US);
+    } while (capture_now_ms() < deadline);
+
+    return last_ret;
+}
 
 static void apply_capture_gain(void* buf, size_t len)
 {
@@ -345,6 +414,7 @@ static int open_media_recorder_capture(audio_capture_t* cap,
             TAG, errno);
         return -errno;
     }
+    cap->backend = AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER;
 
     snprintf(opts, sizeof(opts),
         "format=s%ule:sample_rate=%u:ch_layout=%s",
@@ -354,12 +424,10 @@ static int open_media_recorder_capture(audio_capture_t* cap,
     ret = media_recorder_prepare(cap->handle.recorder, NULL, opts);
     if (ret < 0) {
         syslog(LOG_ERR, "[%s] prepare failed: %d\n", TAG, ret);
-        media_recorder_close(cap->handle.recorder);
-        cap->handle.recorder = NULL;
-        return ret;
+        int close_ret = close_media_recorder(cap, CAP_CLOSE_TIMEOUT_MS);
+        return close_ret < 0 ? close_ret : ret;
     }
 
-    cap->backend = AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER;
     cap->bits_per_sample = bits_per_sample;
     cap->requested_channels = channels;
     cap->hw_channels = channels;
@@ -377,8 +445,11 @@ audio_capture_t* audio_capture_open(const char* dev_path,
 {
     if (s_active_capture) {
         syslog(LOG_WARNING, "[%s] force closing stale capture\n", TAG);
-        audio_capture_close(s_active_capture);
-        usleep(100000);
+        int ret = audio_capture_close(s_active_capture);
+        if (ret < 0) {
+            errno = -ret;
+            return NULL;
+        }
     }
 
     audio_capture_t* cap = calloc(1, sizeof(*cap));
@@ -403,7 +474,13 @@ audio_capture_t* audio_capture_open(const char* dev_path,
         ret = open_media_recorder_capture(cap, sample_rate, channels,
             bits_per_sample);
         if (ret < 0) {
-            free(cap);
+            if (cap->backend == AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER &&
+                cap->handle.recorder) {
+                s_active_capture = cap;
+            } else {
+                free(cap);
+            }
+            errno = -ret;
             return NULL;
         }
     }
@@ -448,6 +525,12 @@ int audio_capture_start(audio_capture_t* cap)
             return -EINVAL;
         }
 
+        cap->route = s_route;
+        if (cap->route && !cap->route_active) {
+            ret = cap->route(1);
+            if (ret < 0) return ret;
+            cap->route_active = 1;
+        }
         ret = media_recorder_start(cap->handle.recorder);
         if (ret < 0) {
             syslog(LOG_ERR, "[%s] start failed: %d\n", TAG, ret);
@@ -528,6 +611,29 @@ int audio_capture_read(audio_capture_t* cap, void* buf, size_t len)
             return -EINVAL;
         }
 
+        /* The public recorder read is blocking. Poll its existing data socket
+         * first so endpoint, cancellation and total-turn deadlines remain
+         * observable without changing Media or its socket ownership. */
+        int socket = media_recorder_get_socket(cap->handle.recorder);
+        if (socket < 0) {
+            return socket;
+        }
+        struct pollfd fd = { .fd = socket, .events = POLLIN };
+        int ready;
+        do {
+            ready = poll(&fd, 1, 100);
+        } while (ready < 0 && errno == EINTR);
+        if (ready == 0) {
+            return -EAGAIN;
+        }
+        if (ready < 0) {
+            return -errno;
+        }
+        if (!(fd.revents & POLLIN)) {
+            return fd.revents & (POLLERR | POLLHUP | POLLNVAL) ?
+                -EPIPE : -EAGAIN;
+        }
+
         n = media_recorder_read_data(cap->handle.recorder, buf, len);
         if (n > 0 && cap->bits_per_sample == 16) {
             apply_capture_gain(buf, (size_t)n);
@@ -574,10 +680,10 @@ int audio_capture_abort(audio_capture_t* cap)
     }
 }
 
-void audio_capture_close(audio_capture_t* cap)
+int audio_capture_close(audio_capture_t* cap)
 {
     if (!cap) {
-        return;
+        return 0;
     }
 
     switch (cap->backend) {
@@ -599,9 +705,8 @@ void audio_capture_close(audio_capture_t* cap)
     case AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER:
         if (cap->handle.recorder) {
             media_recorder_stop(cap->handle.recorder);
-            usleep(50 * 1000);
-            media_recorder_close(cap->handle.recorder);
-            cap->handle.recorder = NULL;
+            int ret = close_media_recorder(cap, CAP_CLOSE_TIMEOUT_MS);
+            if (ret < 0) return ret;
         }
         break;
 
@@ -609,10 +714,32 @@ void audio_capture_close(audio_capture_t* cap)
         break;
     }
 
+    int ret = release_capture_route(cap, CAP_CLOSE_TIMEOUT_MS);
+    if (ret < 0) return ret;
     if (s_active_capture == cap) {
         s_active_capture = NULL;
     }
 
     free(cap);
     syslog(LOG_INFO, "[%s] closed\n", TAG);
+    return 0;
+}
+
+int audio_capture_cleanup(unsigned int timeout_ms)
+{
+    audio_capture_t* cap = s_active_capture;
+    if (!cap) return 0;
+    if (cap->backend == AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER &&
+        cap->handle.recorder) {
+        media_recorder_stop(cap->handle.recorder);
+        int ret = close_media_recorder(cap, timeout_ms);
+        if (ret < 0) return ret;
+    }
+    int ret = release_capture_route(cap, timeout_ms);
+    if (ret < 0) return ret;
+    if (s_active_capture == cap) s_active_capture = NULL;
+    free(cap->scratch);
+    free(cap);
+    syslog(LOG_INFO, "[%s] retained capture released\n", TAG);
+    return 0;
 }

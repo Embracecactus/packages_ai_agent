@@ -42,8 +42,18 @@ int audio_playback_write(audio_playback_t* pb,
  * Safe to call from any thread; safe if pb is NULL. */
 void audio_playback_stop(audio_playback_t* pb);
 
-/* Stop playback and release all resources. */
-void audio_playback_close(audio_playback_t* pb);
+/* Send EOF and wait for the Media completion/failure event. Call after the
+ * final write, from the sole playback owner. Cancellation remains available. */
+int audio_playback_drain(audio_playback_t* pb, unsigned int timeout_ms);
+
+/* Stop playback and release all resources after the writer has quiesced. */
+/* Consumes pb. A close error retains internal cleanup state and callback
+ * storage until cleanup can be retried before the next player opens. */
+int audio_playback_close(audio_playback_t* pb);
+
+/* Retry release of a player retained after an earlier close failure. The
+ * timeout is shared by all retries; success means no Media player is owned. */
+int audio_playback_cleanup(unsigned int timeout_ms);
 
 #ifdef __cplusplus
 }

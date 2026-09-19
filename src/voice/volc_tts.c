@@ -430,11 +430,26 @@ int volc_tts_synthesize_compat(const char* text,
     return volc_tts_synthesize(text, pcm_out, pcm_cap, pcm_len);
 }
 
+static int volc_tts_capabilities(voice_tts_capabilities_t* caps)
+{
+    *caps = (voice_tts_capabilities_t) {
+        .location = VOICE_TTS_LOCATION_REMOTE,
+        .needs_network = true,
+        .sample_rate = AGENT_TTS_WS_SAMPLE_RATE,
+        .batch_sample_rate = AGENT_VOICE_SAMPLE_RATE,
+        .channels = 1,
+        .bits = 16,
+    };
+    return 0;
+}
+
 /* Backend ops registration */
 static const voice_tts_ops_t s_volc_tts_ops = {
     .name = "volcengine",
     .init = volc_tts_init,
     .synthesize = volc_tts_synthesize,
+    .synthesize_stream = volc_tts_ws_synthesize_stream,
+    .get_capabilities = volc_tts_capabilities,
     .deinit = NULL,
 };
 

@@ -24,12 +24,37 @@
 #include "agent_config.h"
 #include "agent_compat.h"
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <pthread.h>
 
 static const char *TAG = "bus";
+
+int message_bus_reply(const agent_msg_t *request, char *content, int result)
+{
+    if (!request) {
+        free(content);
+        return -EINVAL;
+    }
+    if (request->request_status) {
+        int status = request->request_status(request->request_id);
+        if (status != 0) result = status;
+    }
+    if (!result && (!content || !content[0])) result = -ENODATA;
+    if (!result) {
+        agent_msg_t reply = *request;
+        reply.content = content;
+        reply.image_b64 = NULL;
+        result = message_bus_push_outbound(&reply);
+        if (!result) return 0;
+    }
+    free(content);
+    if (request->request_complete)
+        request->request_complete(request->request_id, result);
+    return result;
+}
 
 /* -- Private Types -------------------------------------------------------- */
 

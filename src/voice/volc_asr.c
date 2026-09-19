@@ -1092,11 +1092,37 @@ static int volc_asr_recognize_ops(const unsigned char* pcm_data,
         text_out, text_cap);
 }
 
+static voice_asr_stream_handle_t volc_asr_stream_open_ops(void)
+{
+    return volc_asr_stream_open();
+}
+
+static int volc_asr_stream_send_ops(voice_asr_stream_handle_t stream,
+    const unsigned char* pcm, size_t len)
+{
+    return volc_asr_stream_send(stream, pcm, len);
+}
+
+static int volc_asr_stream_finish_ops(voice_asr_stream_handle_t stream,
+    char* text_out, size_t text_cap)
+{
+    return volc_asr_stream_finish(stream, text_out, text_cap);
+}
+
+static void volc_asr_stream_abort_ops(voice_asr_stream_handle_t stream)
+{
+    volc_asr_stream_abort(stream);
+}
+
 /* Backend ops registration */
 static const voice_asr_ops_t s_volc_asr_ops = {
     .name = "volcengine",
     .init = volc_asr_init,
     .recognize = volc_asr_recognize_ops,
+    .stream_open = volc_asr_stream_open_ops,
+    .stream_send = volc_asr_stream_send_ops,
+    .stream_finish = volc_asr_stream_finish_ops,
+    .stream_abort = volc_asr_stream_abort_ops,
     .deinit = NULL,
 };
 

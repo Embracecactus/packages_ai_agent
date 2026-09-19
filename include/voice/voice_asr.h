@@ -17,6 +17,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -25,18 +26,34 @@ extern "C" {
 /* Generic ASR backend interface. Each provider implements this struct
  * and registers via voice_asr_register(). */
 
+typedef void *voice_asr_stream_handle_t;
+
 typedef struct voice_asr_ops {
     const char *name;
 
-    /* Load credentials from config store. */
+    /* Prepare resources and freeze configured model/service settings once per
+     * activation. On failure release partial resources. init/deinit must not
+     * call registry functions. Network and credentials are backend concerns. */
     int (*init)(void);
+    /* Optional short per-request reset before concurrent cancellation becomes
+     * possible. This is not model loading and must not call the registry. */
+    int (*prepare_request)(void);
 
     /* Recognize PCM audio (16-bit LE, 16kHz, mono) into text. */
     int (*recognize)(const unsigned char *pcm_data,
                      size_t pcm_len,
                      char *text_out,
                      size_t text_cap);
+    /* Interrupt only; recognize retains ownership until it returns. */
+    int (*cancel)(void);
 
+    /* Optional streaming operations.  All four must be provided together. */
+    voice_asr_stream_handle_t (*stream_open)(void);
+    int (*stream_send)(voice_asr_stream_handle_t stream,
+                       const unsigned char *pcm, size_t len);
+    int (*stream_finish)(voice_asr_stream_handle_t stream,
+                         char *text_out, size_t text_cap);
+    void (*stream_abort)(voice_asr_stream_handle_t stream);
     /* Release resources held by the backend. */
     void (*deinit)(void);
 } voice_asr_ops_t;
@@ -44,7 +61,8 @@ typedef struct voice_asr_ops {
 /* Register an ASR backend. Multiple backends can be registered. */
 int voice_asr_register(const voice_asr_ops_t *ops);
 
-/* Select a backend by name. Returns 0 or -ENOENT. */
+/* Select/reload only when idle (-EBUSY otherwise). Release the old resources
+ * before init; failed init leaves no active backend and never falls back. */
 int voice_asr_set_backend(const char *name);
 
 /* Get the name of the current active backend, or NULL. */
@@ -55,6 +73,12 @@ int voice_asr_recognize(const unsigned char *pcm_data,
                         size_t pcm_len,
                         char *text_out,
                         size_t text_cap);
+int voice_asr_cancel(void);
+/* Optional caller request check, evaluated while claiming the backend and
+ * after its per-request reset. It closes the cancel-before-start window.
+ * The callback must not call the backend registry. */
+int voice_asr_recognize_checked(const unsigned char *pcm, size_t size,
+    char *text, size_t capacity, int (*check)(void *), void *request);
 
 /* ── Streaming ASR interface ─────────────────────────────────── */
 
@@ -62,7 +86,8 @@ int voice_asr_recognize(const unsigned char *pcm_data,
 typedef struct voice_asr_stream voice_asr_stream_t;
 
 /* Open a streaming ASR session using the active backend.
- * Returns NULL if the backend does not support streaming. */
+ * Binds the selected backend/configuration until finish/abort. Returns NULL
+ * with errno set (including ENOTSUP and EBUSY). */
 voice_asr_stream_t *voice_asr_stream_open(void);
 
 /* Send one PCM chunk to the streaming session. */
@@ -73,8 +98,10 @@ int voice_asr_stream_send(voice_asr_stream_t *s,
 int voice_asr_stream_finish(voice_asr_stream_t *s,
                             char *text_out, size_t text_cap);
 
-/* Abort streaming session without waiting for result. */
+/* Destroy the stream after its send/finish/cancel callers have stopped. */
 void voice_asr_stream_abort(voice_asr_stream_t *s);
+bool voice_asr_stream_supported(void);
+bool voice_asr_is_busy(void);
 
 #ifdef __cplusplus
 }

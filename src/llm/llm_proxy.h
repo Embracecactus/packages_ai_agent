@@ -22,6 +22,19 @@
 
 #pragma once
 
+/* Optional synchronous request transport. The owner supplies authentication
+ * and verified I/O; Agent retains JSON, context and tool-loop ownership.
+ * Registration is runtime-only and rejects changes while a call is active. */
+#include <stddef.h>
+typedef int (*llm_transport_t)(const char *request, char *response,
+    size_t capacity, size_t *length, int *http_status, void *context,
+    int (*check)(void *), void *request_context);
+int llm_set_transport(const char *model, const char *host,
+    llm_transport_t transport, int (*cancel)(void *), void *context);
+int llm_clear_transport(void);
+int llm_cancel_request(void);
+int llm_request_busy(void);
+
 #include "cJSON.h"
 #include "agent_compat.h"
 #include "agent_config.h"
@@ -77,6 +90,9 @@ int llm_chat_tools(const char* system_prompt,
     cJSON* messages,
     const char* tools_json,
     llm_response_t* resp);
+int llm_chat_tools_checked(const char *system_prompt, cJSON *messages,
+    const char *tools_json, llm_response_t *resp,
+    int (*check)(void *), void *request_context);
 
 /** Vision chat: send text + base64 image to a vision-capable model.
  *  image_b64 is the raw base64 string (no data: prefix).

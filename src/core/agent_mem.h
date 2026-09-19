@@ -259,9 +259,9 @@ static inline void agent_stream_free(agent_stream_buf_t* sb)
  * NOTE: tool is executed exactly ONCE. No retry to avoid double
  * side-effects on write/mutating tools.
  */
-static inline int agent_tool_exec_streamed(
+static inline int agent_tool_exec_streamed_checked(
     const char* name, const char* input_json,
-    char* output, size_t output_size)
+    char* output, size_t output_size, int (*check)(void*), void* request_context)
 {
     /* Allocate a buffer sized to output_size so the tool can write its
      * full result without truncation.  We avoid the small-then-retry
@@ -271,7 +271,8 @@ static inline int agent_tool_exec_streamed(
     char* buf = malloc(buf_size);
     if (buf) {
         buf[0] = '\0';
-        tool_registry_execute(name, input_json, buf, buf_size);
+        tool_registry_execute_checked(name, input_json, buf, buf_size,
+            check, request_context);
         size_t result_len = strlen(buf);
         if (result_len >= output_size)
             result_len = output_size - 1;
@@ -283,8 +284,16 @@ static inline int agent_tool_exec_streamed(
 
     /* OOM fallback: execute directly into caller buffer */
     output[0] = '\0';
-    tool_registry_execute(name, input_json, output, output_size);
+    tool_registry_execute_checked(name, input_json, output, output_size,
+        check, request_context);
     return (int)strlen(output);
+}
+
+static inline int agent_tool_exec_streamed(
+    const char* name, const char* input_json, char* output, size_t output_size)
+{
+    return agent_tool_exec_streamed_checked(name, input_json, output, output_size,
+        NULL, NULL);
 }
 
 #ifdef __cplusplus

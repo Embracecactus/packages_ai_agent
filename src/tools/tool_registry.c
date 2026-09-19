@@ -59,6 +59,7 @@ typedef struct {
     const char* name;
     tool_provider_fn get_tools;
     tool_executor_fn execute;
+    tool_executor_checked_fn execute_checked;
 } tool_provider_t;
 
 static tool_provider_t s_providers[MAX_PROVIDERS];
@@ -70,9 +71,8 @@ static char* s_tools_json;
 static bool s_tools_dirty = true;
 static pthread_mutex_t s_tools_mtx = PTHREAD_MUTEX_INITIALIZER;
 
-void tool_registry_register_provider(const char* name,
-                                     tool_provider_fn get_tools,
-                                     tool_executor_fn execute)
+static void register_provider(const char* name, tool_provider_fn get_tools,
+    tool_executor_fn execute, tool_executor_checked_fn execute_checked)
 {
     if (s_provider_count >= MAX_PROVIDERS) {
         syslog(LOG_ERR, "[%s] Provider registry full, cannot add '%s'\n",
@@ -82,8 +82,21 @@ void tool_registry_register_provider(const char* name,
     s_providers[s_provider_count].name = name;
     s_providers[s_provider_count].get_tools = get_tools;
     s_providers[s_provider_count].execute = execute;
+    s_providers[s_provider_count].execute_checked = execute_checked;
     s_provider_count++;
     syslog(LOG_INFO, "[%s] Registered tool provider: %s\n", TAG, name);
+}
+
+void tool_registry_register_provider(const char* name,
+    tool_provider_fn get_tools, tool_executor_fn execute)
+{
+    register_provider(name, get_tools, execute, NULL);
+}
+
+void tool_registry_register_provider_checked(const char* name,
+    tool_provider_fn get_tools, tool_executor_checked_fn execute)
+{
+    register_provider(name, get_tools, NULL, execute);
 }
 
 static void register_tool(const agent_tool_t* tool)
@@ -520,6 +533,27 @@ void tool_registry_invalidate(void)
     pthread_mutex_unlock(&s_tools_mtx);
 }
 
+bool tool_registry_has_tool(const char *name)
+{
+    if (!name) return false;
+    char *json = tool_registry_get_tools_json();
+    cJSON *tools = json ? cJSON_Parse(json) : NULL;
+    free(json);
+    bool found = false;
+    if (cJSON_IsArray(tools)) {
+        cJSON *tool;
+        cJSON_ArrayForEach(tool, tools) {
+            cJSON *tool_name = cJSON_GetObjectItemCaseSensitive(tool, "name");
+            if (cJSON_IsString(tool_name) && !strcmp(tool_name->valuestring, name)) {
+                found = true;
+                break;
+            }
+        }
+    }
+    cJSON_Delete(tools);
+    return found;
+}
+
 void tool_registry_cleanup(void)
 {
     pthread_mutex_lock(&s_tools_mtx);
@@ -532,6 +566,19 @@ void tool_registry_cleanup(void)
 int tool_registry_execute(const char *name, const char *input_json,
     char *output, size_t output_size)
 {
+    return tool_registry_execute_checked(name, input_json, output, output_size,
+        NULL, NULL);
+}
+
+int tool_registry_execute_checked(const char *name, const char *input_json,
+    char *output, size_t output_size, int (*check)(void*), void *request_context)
+{
+    int status = check ? check(request_context) : 0;
+    if (status != 0) {
+        snprintf(output, output_size, "Error: tool request stopped (%d)", status);
+        return status;
+    }
+
     /* Security guard check before any tool execution */
     size_t input_len = input_json ? strlen(input_json) : 0;
     tool_guard_result_t guard = tool_guard_check(name, input_json, input_len);
@@ -585,10 +632,13 @@ int tool_registry_execute(const char *name, const char *input_json,
 
     /* Try registered providers */
     for (int p = 0; p < s_provider_count; p++) {
-        if (!s_providers[p].execute) {
+        if (!s_providers[p].execute && !s_providers[p].execute_checked) {
             continue;
         }
-        int ret = s_providers[p].execute(name, input_json, output, output_size);
+        int ret = s_providers[p].execute_checked ?
+            s_providers[p].execute_checked(name, input_json, output, output_size,
+                check, request_context) :
+            s_providers[p].execute(name, input_json, output, output_size);
         if (ret == OK) {
             syslog(LOG_INFO, "[%s] Executed %s tool: %s\n",
                    TAG, s_providers[p].name, name);
