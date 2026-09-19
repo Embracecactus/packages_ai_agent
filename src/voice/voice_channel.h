@@ -17,6 +17,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,6 +28,22 @@ int voice_channel_init(void);
 
 /* Start voice recording, ASR, then push text to agent via message_bus. */
 int voice_channel_start(void);
+int voice_channel_start_auto(void);
+typedef void (*voice_channel_event_cb)(int event, int result);
+#define VOICE_CHANNEL_EVENT_TTS_COMPLETE 1
+#define VOICE_CHANNEL_EVENT_CAPTURE_COMPLETE 2
+#define VOICE_CHANNEL_EVENT_TURN_COMPLETE 3
+#define VOICE_CHANNEL_EVENT_INITIALIZED 4
+#define VOICE_CHANNEL_EVENT_SERVICE_READY 5
+void voice_channel_service_ready(int result);
+int voice_channel_set_event_callback(voice_channel_event_cb callback);
+int voice_channel_is_idle(void);
+int voice_channel_cancel(void);
+
+/* Retry teardown retained after a terminal Media close failure. The product
+ * may call this from its existing service task; no new session is started. */
+int voice_channel_recover(void);
+int voice_channel_speak_reply(uint64_t request_id, const char *text);
 
 /* Stop an active voice session. */
 int voice_channel_stop(void);
@@ -34,7 +51,7 @@ int voice_channel_stop(void);
 /* Stop recording and return ASR text to caller (does NOT push inbound).
  * text_out: buffer to receive ASR text, text_cap: buffer capacity.
  * Returns 0 on success, negative errno on failure.
- * If ASR returns empty text, text_out[0] is set to '\0' (not an error). */
+ * Empty ASR is -ENODATA; cancellation is -ECANCELED. */
 int voice_channel_stop_with_text(char *text_out, size_t text_cap);
 
 /* Synthesize text and play back (called from outbound dispatcher). */

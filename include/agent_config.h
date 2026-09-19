@@ -373,6 +373,13 @@
 #define AGENT_VOICE_B64_BUF_SIZE (96 * 1024)
 
 /* Config store keys */
+/* Backend/model/voice are independent, non-secret selection values in the
+ * existing config store. Location is "device" or "remote" and must agree with
+ * the selected engine. Asset paths and identities are backend-owned. */
+#define AGENT_CFG_KEY_TTS_BACKEND "tts_backend"
+#define AGENT_CFG_KEY_TTS_VOICE "tts_voice"
+#define AGENT_CFG_KEY_TTS_LOCATION "tts_location"
+
 #define AGENT_CFG_KEY_VOLC_APPKEY "volc_appkey"
 #define AGENT_CFG_KEY_VOLC_TOKEN "volc_token"
 #define AGENT_CFG_KEY_VOLC_API_KEY "volc_api_key"

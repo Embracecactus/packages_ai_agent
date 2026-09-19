@@ -27,8 +27,8 @@
 #include "core/agent_trace.h"
 #include "core/context_builder.h"
 #include "core/message_bus.h"
+#include <errno.h>
 #include "core/session_mgr.h"
-#include "llm/llm_cache.h"
 #include "llm/llm_proxy.h"
 #include "llm/llm_router.h"
 #include "tools/skill_loader.h"
@@ -57,6 +57,7 @@ static const char* TAG = "agent";
 static char* handle_slash_note(const agent_msg_t* msg);
 static char* handle_slash_remind(const agent_msg_t* msg);
 static bool llm_call_timed_out(uint32_t latency_ms);
+static int agent_request_check(void *context);
 
 /* ── Timeout message constants ─────────────────────────────── */
 
@@ -170,6 +171,7 @@ typedef struct {
     bool from_pool;
     char channel[16];
     char chat_id[64];
+    const agent_msg_t* request;
 } tool_task_t;
 
 static void* tool_exec_thread(void* arg)
@@ -179,9 +181,9 @@ static void* tool_exec_thread(void* arg)
     t->output[0] = '\0';
     char* patched = inject_cron_context(
         t->call->name, t->call->input, t->channel, t->chat_id);
-    agent_tool_exec_streamed(t->call->name,
+    agent_tool_exec_streamed_checked(t->call->name,
         patched ? patched : t->call->input,
-        t->output, t->output_size);
+        t->output, t->output_size, agent_request_check, (void*)t->request);
     free(patched);
     syslog(LOG_INFO, "[%s] Tool %s result: %d bytes\n",
         TAG, t->call->name, (int)strlen(t->output));
@@ -194,7 +196,7 @@ static void* tool_exec_thread(void* arg)
 static void add_tool_result_messages(cJSON* messages,
     const llm_response_t* resp, char* tool_output,
     size_t tool_output_size, const char* msg_channel,
-    const char* msg_chat_id)
+    const char* msg_chat_id, const agent_msg_t* request)
 {
     int n = resp->call_count;
 
@@ -206,9 +208,9 @@ static void add_tool_result_messages(cJSON* messages,
         tool_output[0] = '\0';
         char* patched = inject_cron_context(
             call->name, call->input, msg_channel, msg_chat_id);
-        agent_tool_exec_streamed(call->name,
+        agent_tool_exec_streamed_checked(call->name,
             patched ? patched : call->input,
-            tool_output, tool_output_size);
+            tool_output, tool_output_size, agent_request_check, (void*)request);
         free(patched);
         syslog(LOG_INFO, "[%s] Tool %s result: %d bytes\n", TAG,
             call->name, (int)strlen(tool_output));
@@ -222,13 +224,14 @@ static void add_tool_result_messages(cJSON* messages,
     }
 
     /* Parallel path */
-    tool_task_t tasks[AGENT_MAX_TOOL_CALLS];
+    tool_task_t tasks[AGENT_MAX_TOOL_CALLS] = {0};
     pthread_t threads[AGENT_MAX_TOOL_CALLS];
     size_t par_buf_size = agent_mem_safe_size(
         TOOL_OUTPUT_SIZE_LARGE, TOOL_OUTPUT_SIZE_MIN);
 
     for (int i = 0; i < n; i++) {
         tasks[i].call = &resp->calls[i];
+        tasks[i].request = request;
         strncpy(tasks[i].channel, msg_channel ? msg_channel : "",
             sizeof(tasks[i].channel) - 1);
         strncpy(tasks[i].chat_id, msg_chat_id ? msg_chat_id : "",
@@ -359,6 +362,8 @@ static char* handle_nl_fast_path(const char* text)
     /* Table-driven: scan intents, first match wins */
     for (int i = 0; s_intents[i].keywords; i++) {
         if (contains_any(text, s_intents[i].keywords)) {
+            /* 能力未注册时走正常 Agent；已执行工具的失败不能触发重复调用。 */
+            if (!tool_registry_has_tool(s_intents[i].tool_name)) return NULL;
             char* reply = calloc(1, s_intents[i].output_size);
             if (reply) {
                 tool_registry_execute(s_intents[i].tool_name,
@@ -390,6 +395,7 @@ static char* handle_nl_fast_path(const char* text)
     static const char* kw_weather[] = {
         "天气怎么样", "weather", "天气如何", NULL };
     if (contains_any(text, kw_weather)) {
+        if (!tool_registry_has_tool("get_weather")) return NULL;
         char safe_city[64];
         strncpy(safe_city, "Beijing", sizeof(safe_city) - 1);
         safe_city[sizeof(safe_city) - 1] = '\0';
@@ -430,6 +436,8 @@ static char* handle_nl_fast_path(const char* text)
             if (p) { p += 5; while (*p == ' ') p++; if (*p) kw = p; }
         }
         if (kw) {
+            if (!tool_registry_has_tool("music_search") ||
+                !tool_registry_has_tool("music_play")) return NULL;
             int klen = 0;
             while (kw[klen] && kw[klen] != '"' && kw[klen] != '\\' && klen < 100)
                 klen++;
@@ -803,7 +811,7 @@ static char* strip_tool_call_markup(char* text)
 /* ── Extracted: force finish when iteration limit reached ─── */
 
 static char* force_finish_reply(const char* system_prompt,
-    cJSON* messages)
+    cJSON* messages, const agent_msg_t *msg)
 {
     syslog(LOG_WARNING,
         "[%s] Tool iteration limit (%d) reached, forcing finish\n",
@@ -821,7 +829,8 @@ static char* force_finish_reply(const char* system_prompt,
     char* result = NULL;
     struct timeval t0, t1;
     gettimeofday(&t0, NULL);
-    int err = llm_chat_tools(system_prompt, messages, NULL, &resp);
+    int err = llm_chat_tools_checked(system_prompt, messages, NULL, &resp,
+        agent_request_check, (void *)msg);
     gettimeofday(&t1, NULL);
     uint32_t ms = calc_elapsed_ms(&t0, &t1);
     bool timed_out = llm_call_timed_out(ms);
@@ -840,35 +849,17 @@ static char* force_finish_reply(const char* system_prompt,
 
 /* ── Extracted: dispatch response to outbound bus ─────────── */
 
-static void dispatch_response(const agent_msg_t* msg,
-    char* final_text)
+static void dispatch_response(const agent_msg_t* msg, char* final_text)
 {
     if (final_text && final_text[0]) {
         session_append(msg->chat_id, "user", msg->content);
         session_append(msg->chat_id, "assistant", final_text);
-
-        agent_msg_t out = { 0 };
-        strncpy(out.channel, msg->channel,
-            sizeof(out.channel) - 1);
-        strncpy(out.chat_id, msg->chat_id,
-            sizeof(out.chat_id) - 1);
-        out.content = final_text;
-        if (message_bus_push_outbound(&out) != OK) {
-            free(final_text);
-        }
+        message_bus_reply(msg, final_text, 0);
+    } else if (msg->request_complete) {
+        message_bus_reply(msg, final_text, -ENODATA);
     } else {
         free(final_text);
-        agent_msg_t out = { 0 };
-        strncpy(out.channel, msg->channel,
-            sizeof(out.channel) - 1);
-        strncpy(out.chat_id, msg->chat_id,
-            sizeof(out.chat_id) - 1);
-        out.content = strdup("Sorry, I encountered an error.");
-        if (out.content) {
-            if (message_bus_push_outbound(&out) != OK) {
-                free(out.content);
-            }
-        }
+        message_bus_reply(msg, strdup("Sorry, I encountered an error."), 0);
     }
 }
 
@@ -976,7 +967,7 @@ static bool llm_call_timed_out(uint32_t latency_ms)
 /* Handle TASK_COMPLETE: inject hint and do one final LLM call.
  * If the LLM call times out, *out_timed_out is set to true. */
 static char* handle_task_complete(const char* sys_prompt, cJSON* messages,
-    bool* out_timed_out)
+    bool* out_timed_out, const agent_msg_t *msg)
 {
     cJSON* hint = cJSON_CreateObject();
 
@@ -991,7 +982,8 @@ static char* handle_task_complete(const char* sys_prompt, cJSON* messages,
     char* result = NULL;
     struct timeval t0, t1;
     gettimeofday(&t0, NULL);
-    int err = llm_chat_tools(sys_prompt, messages, NULL, &final_resp);
+    int err = llm_chat_tools_checked(sys_prompt, messages, NULL, &final_resp,
+        agent_request_check, (void *)msg);
     gettimeofday(&t1, NULL);
     uint32_t ms = calc_elapsed_ms(&t0, &t1);
     bool timed_out = llm_call_timed_out(ms);
@@ -1012,10 +1004,17 @@ static char* handle_task_complete(const char* sys_prompt, cJSON* messages,
 }
 
 /* Run the ReAct tool-calling loop. Returns final_text (caller owns). */
+static int agent_request_check(void *context)
+{
+    const agent_msg_t *msg = context;
+    return msg->request_status ? msg->request_status(msg->request_id) : 0;
+}
+
 static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     const char* tools_json, char* tool_output, size_t tool_size,
-    const agent_msg_t* msg)
+    const agent_msg_t* msg, int *failure)
 {
+    *failure = 0;
     char prev_sig[512];
     int dup_count;
     char prev_name[64];
@@ -1027,7 +1026,6 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     dup_count = 0;
     prev_name[0] = '\0';
     name_repeat = 0;
-    int last_total_tokens = 0;
     bool watchdog_fired = false;
 
     /* Router: select and apply best backend before first LLM call.
@@ -1047,29 +1045,29 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     agent_trace_begin(&trace, msg->chat_id, msg->channel);
     trace.backend_idx = router_idx;
 
-    /* Cache check: for simple queries, try cache before LLM call */
-    if (msg->content && complexity == LLM_COMPLEXITY_SIMPLE) {
-        char* cached = llm_cache_get(msg->content, strlen(msg->content));
-        if (cached) {
-            syslog(LOG_INFO, "[%s] Cache hit, skipping LLM call\n", TAG);
-            final_text = cached;
-            agent_trace_step(&trace, 0, NULL, 0, 1);
-            agent_trace_end(&trace, AGENT_TRACE_OK);
-            goto send_reply;
-        }
-    }
+    /* 仅凭本句文本不能复用回复：会话、模型、系统提示及工具状态都会变化。
+     * 每次请求使用当前上下文执行，也必须实际调用需要新鲜数据的工具。
+     */
 
     for (iteration = 0; iteration < AGENT_AI_AGENT_MAX_TOOL_ITER;
          iteration++) {
+        if (msg->request_status && msg->request_status(msg->request_id) != 0)
+            break;
         send_working_status(msg, iteration);
 
         llm_response_t resp;
         struct timeval tv_start, tv_end;
         gettimeofday(&tv_start, NULL);
-        int err = llm_chat_tools(sys_prompt, messages, tools_json, &resp);
+        int err = llm_chat_tools_checked(sys_prompt, messages, tools_json, &resp,
+            agent_request_check, (void *)msg);
         gettimeofday(&tv_end, NULL);
         uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
 
+        if (msg->request_complete && err != OK) {
+            llm_response_free(&resp);
+            *failure = err < 0 ? err : -EIO;
+            break;
+        }
         /* Router failover: on LLM call failure, try next backend */
         if (err != OK && router_idx >= 0) {
             syslog(LOG_WARNING,
@@ -1084,8 +1082,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                 trace.backend_idx = next_idx;
                 llm_response_free(&resp);
                 gettimeofday(&tv_start, NULL);
-                err = llm_chat_tools(sys_prompt, messages,
-                    tools_json, &resp);
+                err = llm_chat_tools_checked(sys_prompt, messages,
+                    tools_json, &resp, agent_request_check, (void *)msg);
                 gettimeofday(&tv_end, NULL);
                 latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
             }
@@ -1136,7 +1134,6 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
             if (resp.total_tokens > 0) {
                 llm_router_report_tokens(router_idx,
                     resp.prompt_tokens, resp.completion_tokens);
-                last_total_tokens = resp.total_tokens;
             }
         }
 
@@ -1184,8 +1181,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                     trace.backend_idx = prem_idx;
 
                     gettimeofday(&tv_start, NULL);
-                    err = llm_chat_tools(sys_prompt, messages,
-                        tools_json, &resp);
+                    err = llm_chat_tools_checked(sys_prompt, messages,
+                        tools_json, &resp, agent_request_check, (void *)msg);
                     gettimeofday(&tv_end, NULL);
                     latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
 
@@ -1249,14 +1246,14 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         if (should_break) {
             add_assistant_message(messages, &resp);
             add_tool_result_messages(messages, &resp, tool_output,
-                tool_size, msg->channel, msg->chat_id);
+                tool_size, msg->channel, msg->chat_id, msg);
             llm_response_free(&resp);
             break;
         }
 
         add_assistant_message(messages, &resp);
         add_tool_result_messages(messages, &resp, tool_output,
-            tool_size, msg->channel, msg->chat_id);
+            tool_size, msg->channel, msg->chat_id, msg);
 
         /* Local tool shortcut: if the single tool in this round is a
          * local file op, skip the next LLM round and use the tool
@@ -1321,7 +1318,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
             llm_response_free(&resp);
             bool task_timed_out = false;
             final_text = handle_task_complete(sys_prompt, messages,
-                &task_timed_out);
+                &task_timed_out, msg);
             if (task_timed_out) {
                 watchdog_fired = true;
             }
@@ -1333,7 +1330,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
 
     /* Iteration limit reached — force a summary reply */
     if (!final_text && iteration >= AGENT_AI_AGENT_MAX_TOOL_ITER) {
-        final_text = force_finish_reply(sys_prompt, messages);
+        final_text = force_finish_reply(sys_prompt, messages, msg);
         agent_trace_end(&trace, AGENT_TRACE_TIMEOUT);
     } else if (watchdog_fired) {
         agent_trace_end(&trace, AGENT_TRACE_TIMEOUT);
@@ -1341,17 +1338,6 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         agent_trace_end(&trace, AGENT_TRACE_OK);
     } else {
         agent_trace_end(&trace, AGENT_TRACE_FAIL);
-    }
-
-send_reply:
-    /* Cache store: save simple query responses for future reuse */
-    if (final_text && msg->content
-        && complexity == LLM_COMPLEXITY_SIMPLE) {
-        llm_cache_put(msg->content, strlen(msg->content), final_text);
-        if (last_total_tokens > 0) {
-            llm_cache_put_tokens(msg->content, strlen(msg->content),
-                last_total_tokens);
-        }
     }
 
     return final_text;
@@ -1462,6 +1448,7 @@ static void* agent_loop_task(void* arg)
         }
 
         if (agent_shutdown_requested()) {
+            message_bus_reply(&msg, NULL, -ESHUTDOWN);
             free(msg.content);
             free(msg.image_b64);
             break;
@@ -1470,24 +1457,22 @@ static void* agent_loop_task(void* arg)
         syslog(LOG_INFO, "[%s] Processing message from %s:%s\n",
             TAG, msg.channel, msg.chat_id);
 
+        if (msg.request_status && msg.request_status(msg.request_id) != 0) {
+            message_bus_reply(&msg, NULL, -ECANCELED);
+            message_bus_msg_free(&msg);
+            continue;
+        }
         /* Check memory pressure */
         agent_mem_get_status(&mem_st);
         if (mem_st.free_heap < AGENT_MEM_RESERVE_BYTES) {
             syslog(LOG_WARNING,
                 "[%s] Low memory: %zu bytes free, skipping\n",
                 TAG, mem_st.free_heap);
-            agent_msg_t out = { 0 };
-            strncpy(out.channel, msg.channel,
-                sizeof(out.channel) - 1);
-            strncpy(out.chat_id, msg.chat_id,
-                sizeof(out.chat_id) - 1);
-            out.content = strdup("系统内存不足，请稍后再试。");
-            if (out.content) {
-                if (message_bus_push_outbound(&out) != OK) {
-                    free(out.content);
-                }
-            }
-            free(msg.content);
+            if (msg.request_complete)
+                message_bus_reply(&msg, NULL, -ENOMEM);
+            else
+                message_bus_reply(&msg, strdup("系统内存不足，请稍后再试。"), 0);
+            message_bus_msg_free(&msg);
             continue;
         }
 
@@ -1501,8 +1486,9 @@ static void* agent_loop_task(void* arg)
                 TAG, msg.channel, msg.chat_id);
             reply = strdup("I can't do that.");
             if (!reply) {
-                /* Fail-closed: skip this message entirely */
-                free(msg.content);
+                /* Fail-closed: report a terminal error before dropping. */
+                message_bus_reply(&msg, NULL, -ENOMEM);
+                message_bus_msg_free(&msg);
                 continue;
             }
         }
@@ -1513,16 +1499,8 @@ static void* agent_loop_task(void* arg)
         }
 
         if (reply) {
-            agent_msg_t out = { 0 };
-            strncpy(out.channel, msg.channel,
-                sizeof(out.channel) - 1);
-            strncpy(out.chat_id, msg.chat_id,
-                sizeof(out.chat_id) - 1);
-            out.content = reply;
-            if (message_bus_push_outbound(&out) != OK) {
-                free(reply);
-            }
-            free(msg.content);
+            message_bus_reply(&msg, reply, 0);
+            message_bus_msg_free(&msg);
             continue;
         }
 
@@ -1544,6 +1522,7 @@ static void* agent_loop_task(void* arg)
             history_json, hist_size);
 
         char* final_text = NULL;
+        int failure = 0;
 
         /* Vision path */
         final_text = handle_vision_message(&msg);
@@ -1553,11 +1532,12 @@ static void* agent_loop_task(void* arg)
             /* ReAct loop */
             s_llm_path_count++;
             final_text = run_react_loop(sys_prompt, messages,
-                tools_json, tool_output, tool_size, &msg);
+                tools_json, tool_output, tool_size, &msg, &failure);
             cJSON_Delete(messages);
         }
 
-        dispatch_response(&msg, final_text);
+        if (failure) message_bus_reply(&msg, final_text, failure);
+        else dispatch_response(&msg, final_text);
 
         /* Free image_b64 if not already freed by vision path */
         free(msg.image_b64);

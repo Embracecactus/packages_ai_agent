@@ -26,6 +26,11 @@ extern "C" {
 /* Audio capture session handle (opaque). */
 typedef struct audio_capture audio_capture_t;
 
+/* Optional platform route/policy mapping. Install before opening capture.
+ * The capture owner enables it before start and disables it after close.
+ * An error prevents capture or is retained for cleanup before the next open. */
+int audio_capture_set_route(int (*route)(int active));
+
 /* Open the capture device and configure for PCM recording.
  * Returns NULL on failure. */
 audio_capture_t *audio_capture_open(const char *dev_path,
@@ -43,8 +48,12 @@ int audio_capture_read(audio_capture_t *cap,
 /* Interrupt any in-flight blocking read without freeing the handle. */
 int audio_capture_abort(audio_capture_t* cap);
 
-/* Stop recording and release all resources. */
-void audio_capture_close(audio_capture_t *cap);
+/* Stop recording and release all resources. A negative result means the
+ * handle remains owned and must not be replaced by another capture. */
+int audio_capture_close(audio_capture_t *cap);
+
+/* Retry release of a capture retained after an open/close failure. */
+int audio_capture_cleanup(unsigned int timeout_ms);
 
 #ifdef __cplusplus
 }

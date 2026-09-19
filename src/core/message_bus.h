@@ -36,7 +36,14 @@ typedef struct {
     char  chat_id[64];   /**< chat_id (Feishu IDs are ~36 chars) */
     char *content;       /**< Heap-allocated text; receiver must free. */
     char *image_b64;     /**< Optional base64-encoded image; receiver must free. NULL if none. */
+    uint64_t request_id; /**< Optional origin-owned correlation; zero is untracked. */
+    int (*request_status)(uint64_t request_id);
+    void (*request_complete)(uint64_t request_id, int result);
 } agent_msg_t;
+
+/* Final reply only. Consumes content even on failure. Completion is reported
+ * after channel delivery, or immediately if a reply cannot be queued. */
+int message_bus_reply(const agent_msg_t *request, char *content, int result);
 
 /** Free heap members (content, image_b64) of a message.
  *  Safe to call on a zeroed or already-freed message. */

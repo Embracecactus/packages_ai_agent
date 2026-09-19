@@ -23,6 +23,7 @@
 #include "llm/llm_internal.h"
 #include "llm/llm_parse.h"
 #include "llm/llm_proxy.h"
+#include <errno.h>
 #include "core/message_bus.h"
 #include "infra/config_store.h"
 #include "infra/http_proxy.h"
@@ -61,6 +62,71 @@ bool is_openai_compat_host(const char* host)
         || strstr(host, "xiaomimimo.com");
 }
 
+
+/* Selected transport is an extension of the existing LLM client, not an
+ * independent provider or turn owner. */
+static llm_transport_t s_transport;
+static int (*s_transport_cancel)(void *);
+static void *s_transport_context;
+static unsigned int s_transport_users;
+
+int llm_request_busy(void)
+{
+    pthread_mutex_lock(&s_llm_lock);
+    int busy = s_transport_users != 0;
+    pthread_mutex_unlock(&s_llm_lock);
+    return busy;
+}
+
+int llm_set_transport(const char *model, const char *host,
+    llm_transport_t transport, int (*cancel)(void *), void *context)
+{
+    if (!model || !host || !transport || strlen(model) >= sizeof(s_model) ||
+        strlen(host) >= sizeof(s_llm_host)) return -EINVAL;
+    pthread_mutex_lock(&s_llm_lock);
+    if (s_transport_users) { pthread_mutex_unlock(&s_llm_lock); return -EBUSY; }
+    strcpy(s_model, model);
+    strcpy(s_llm_host, host);
+    /* An external transport owns authentication. Do not retain a credential
+     * that could silently enable the built-in path after a later clear. */
+    memset(s_api_key, 0, sizeof(s_api_key));
+    s_transport = transport;
+    s_transport_cancel = cancel;
+    s_transport_context = context;
+    pthread_mutex_unlock(&s_llm_lock);
+    return 0;
+}
+
+int llm_clear_transport(void)
+{
+    pthread_mutex_lock(&s_llm_lock);
+    if (s_transport_users) {
+        pthread_mutex_unlock(&s_llm_lock);
+        return -EBUSY;
+    }
+    s_transport = NULL;
+    s_transport_cancel = NULL;
+    s_transport_context = NULL;
+    memset(s_api_key, 0, sizeof(s_api_key));
+    memset(s_model, 0, sizeof(s_model));
+    memset(s_llm_host, 0, sizeof(s_llm_host));
+    pthread_mutex_unlock(&s_llm_lock);
+    return 0;
+}
+
+int llm_cancel_request(void)
+{
+    pthread_mutex_lock(&s_llm_lock);
+    int (*cancel)(void *) = s_transport_cancel;
+    void *context = s_transport_context;
+    if (cancel) s_transport_users++;
+    pthread_mutex_unlock(&s_llm_lock);
+    int ret = cancel ? cancel(context) : -ENOTSUP;
+    pthread_mutex_lock(&s_llm_lock);
+    if (cancel) s_transport_users--;
+    pthread_mutex_unlock(&s_llm_lock);
+    return ret;
+}
 
 int resp_buf_init(resp_buf_t* rb, size_t initial_cap)
 {
@@ -477,9 +543,34 @@ static int llm_http_via_proxy(const char* post_data, resp_buf_t* rb,
     return OK;
 }
 
-int llm_http_call(const char* post_data, resp_buf_t* rb,
-    int* out_status)
+static int llm_http_call_checked(const char* post_data, resp_buf_t* rb,
+    int* out_status, int (*check)(void *), void *request_context);
+
+int llm_http_call(const char* post_data, resp_buf_t* rb, int* out_status)
 {
+    return llm_http_call_checked(post_data, rb, out_status, NULL, NULL);
+}
+
+static int llm_http_call_checked(const char* post_data, resp_buf_t* rb,
+    int* out_status, int (*check)(void *), void *request_context)
+{
+    int status = check ? check(request_context) : 0;
+    if (status) return status;
+    pthread_mutex_lock(&s_llm_lock);
+    llm_transport_t transport = s_transport;
+    void *context = s_transport_context;
+    if (transport) s_transport_users++;
+    pthread_mutex_unlock(&s_llm_lock);
+    if (transport) {
+        int ret = resp_buf_init(rb, AGENT_LLM_STREAM_BUF_SIZE);
+        if (ret == 0) ret = transport(post_data, rb->data, rb->cap,
+            &rb->len, out_status, context, check, request_context);
+        if (ret != 0) resp_buf_free(rb);
+        pthread_mutex_lock(&s_llm_lock);
+        s_transport_users--;
+        pthread_mutex_unlock(&s_llm_lock);
+        return ret;
+    }
     /* For plain HTTP endpoints (port != 443), always use direct path.
      * The proxy does CONNECT + TLS which fails on non-TLS endpoints.
      * Non-TLS HTTP endpoints (port != 443) are reachable
@@ -582,7 +673,10 @@ int llm_chat(const char* system_prompt, const char* messages_json,
     memcpy(llm_host, s_llm_host, sizeof(llm_host));
     pthread_mutex_unlock(&s_llm_lock);
 
-    if (api_key[0] == '\0') {
+    pthread_mutex_lock(&s_llm_lock);
+    int external_transport = s_transport != NULL;
+    pthread_mutex_unlock(&s_llm_lock);
+    if (api_key[0] == '\0' && !external_transport) {
         snprintf(response_buf, buf_size, "Error: No API key configured");
         return ERROR;
     }
@@ -685,6 +779,13 @@ int llm_chat(const char* system_prompt, const char* messages_json,
 int llm_chat_tools(const char* system_prompt, cJSON* messages,
     const char* tools_json, llm_response_t* resp)
 {
+    return llm_chat_tools_checked(system_prompt, messages, tools_json, resp, NULL, NULL);
+}
+
+int llm_chat_tools_checked(const char* system_prompt, cJSON* messages,
+    const char* tools_json, llm_response_t* resp,
+    int (*check)(void *), void *request_context)
+{
     memset(resp, 0, sizeof(*resp));
 
     /* Snapshot config under lock */
@@ -698,7 +799,10 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
     memcpy(llm_host, s_llm_host, sizeof(llm_host));
     pthread_mutex_unlock(&s_llm_lock);
 
-    if (api_key[0] == '\0') {
+    pthread_mutex_lock(&s_llm_lock);
+    int external_transport = s_transport != NULL;
+    pthread_mutex_unlock(&s_llm_lock);
+    if (api_key[0] == '\0' && !external_transport) {
         return ERROR;
     }
 
@@ -752,12 +856,19 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
             unsigned int delay = AGENT_LLM_RETRY_BASE_SEC << (retry - 1);
             syslog(LOG_WARNING, "[%s] Rate limited (429), retry %d/%d after %us\n",
                 TAG, retry, AGENT_LLM_MAX_RETRIES, delay);
-            sleep(delay);
+            while (delay--) {
+                int canceled = check ? check(request_context) : 0;
+                if (canceled != 0) {
+                    free(post_data);
+                    return canceled;
+                }
+                sleep(1);
+            }
         }
 
         rb.len = 0;
         status = 0;
-        err = llm_http_call(post_data, &rb, &status);
+        err = llm_http_call_checked(post_data, &rb, &status, check, request_context);
 
         if (err != OK) {
             resp_buf_free(&rb);

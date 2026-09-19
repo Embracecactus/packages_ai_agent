@@ -23,6 +23,7 @@
 #pragma once
 
 #include "agent_compat.h"
+#include <stdbool.h>
 #include <stddef.h>
 
 #ifdef __cplusplus
@@ -91,6 +92,12 @@ typedef char* (*tool_provider_fn)(void);
 typedef int (*tool_executor_fn)(const char* name, const char* input_json,
                                 char* output, size_t output_size);
 
+/* 请求上下文只在同步执行期间借用；检查函数仍由原请求的 owner 提供。
+ * 长耗时工具应在各阶段及子请求中复用检查，不另建取消状态。
+ */
+typedef int (*tool_executor_checked_fn)(const char* name, const char* input_json,
+    char* output, size_t output_size, int (*check)(void*), void* request_context);
+
 /**
  * Register an external tool provider (e.g., node_manager, mcp_client).
  * The provider's get_tools_json callback will be called during tools JSON build.
@@ -100,14 +107,19 @@ typedef int (*tool_executor_fn)(const char* name, const char* input_json,
 void tool_registry_register_provider(const char* name,
                                      tool_provider_fn get_tools,
                                      tool_executor_fn execute);
+void tool_registry_register_provider_checked(const char* name,
+    tool_provider_fn get_tools, tool_executor_checked_fn execute);
 
 int   tool_registry_init(void);
 char *tool_registry_get_tools_json(void);  /* caller must free() */
 void  tool_registry_rebuild_json(void);    /* force rebuild tools JSON now */
 void  tool_registry_invalidate(void);      /* mark tools dirty for rebuild */
 void  tool_registry_cleanup(void);         /* free tools JSON cache */
+bool  tool_registry_has_tool(const char *name);
 int   tool_registry_execute(const char *name, const char *input_json,
                                    char *output, size_t output_size);
+int   tool_registry_execute_checked(const char *name, const char *input_json,
+    char *output, size_t output_size, int (*check)(void*), void *request_context);
 
 #ifdef __cplusplus
 }
