@@ -384,19 +384,36 @@ static void* outbound_dispatch_task(void* arg)
             mqtt_channel_send(msg.chat_id, msg.content);
 #endif
         } else if (strcmp(msg.channel, AGENT_CHAN_VOICE) == 0) {
+            int vret;
+            bool tracked_voice_reply = msg.request_status && msg.request_complete;
+
             /* Check voice cooldown — skip voice dispatch if a recent
              * speak call failed, to prevent error-message cascade. */
             if (s_voice_cooldown && time(NULL) < s_voice_cooldown_until) {
                 syslog(LOG_WARNING,
                     "[%s] voice cooldown active, dropping message\n", TAG);
+                vret = -EAGAIN;
             } else {
                 s_voice_cooldown = false;
-                int vret = voice_channel_speak(msg.content);
+                /* message_bus_reply only queues a completed Agent reply.
+                 * Preserve the originating voice turn's cancellation and
+                 * state transition instead of using the untracked speak
+                 * entry point.  Other voice-originated notifications retain
+                 * the legacy untracked path. */
+                vret = tracked_voice_reply
+                    ? voice_channel_speak_reply(msg.request_id, msg.content)
+                    : voice_channel_speak(msg.content);
                 if (vret != 0) {
                     syslog(LOG_ERR, "[%s] voice_channel_speak failed: %d\n", TAG, vret);
                     s_voice_cooldown = true;
                     s_voice_cooldown_until = time(NULL) + 5;
                 }
+            }
+            /* The outbound queue owns the final delivery.  Complete a
+             * tracked voice turn only after its bounded TTS call has
+             * returned, so cancel/timeout cannot race a stale reply. */
+            if (tracked_voice_reply) {
+                msg.request_complete(msg.request_id, vret);
             }
 #ifdef CONFIG_AI_AGENT_LVGL_UI
         } else if (strcmp(msg.channel, AGENT_CHAN_LVGL_UI) == 0) {
