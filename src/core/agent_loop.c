@@ -1257,12 +1257,15 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
 
         /* Local tool shortcut: if the single tool in this round is a
          * local file op, skip the next LLM round and use the tool
-         * output directly as the reply. Saves ~2s.
+         * output directly as the reply. Saves ~2s.  A voice turn must
+         * not use this path: tool output is not an Agent-confirmed final
+         * assistant body and therefore cannot be sent to TTS.
          * Restricted to call_count == 1: the parallel path does not
          * write into tool_output, so multi-call rounds must go through
          * the LLM to aggregate results (and tool_output would be stale
          * from a prior iteration if we allowed call_count > 1 here). */
-        if (resp.call_count == 1) {
+        if (resp.call_count == 1
+            && strcmp(msg->channel, AGENT_CHAN_VOICE) != 0) {
             bool all_local = true;
             for (int i = 0; i < resp.call_count; i++) {
                 if (strcmp(resp.calls[i].name, "read_file") != 0
