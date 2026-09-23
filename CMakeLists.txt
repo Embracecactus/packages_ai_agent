@@ -25,6 +25,7 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/core/session_mgr.c
     src/core/arena_alloc.c
     src/llm/llm_proxy.c
+    src/llm/llm_stream.c
     src/llm/llm_parse.c
     src/llm/llm_vision.c
     src/llm/llm_router.c
@@ -61,9 +62,11 @@ if(CONFIG_EXAMPLES_AI_AGENT_VELA)
     src/voice/volc_tts.c
     src/voice/volc_tts_ws.c
     src/voice/volc_asr.c
+    src/voice/funasr_asr.c
     src/voice/voice_tts.c
     src/voice/voice_asr.c
     src/voice/audio_capture.c
+    src/voice/voice_endpoint.c
     src/voice/audio_playback.c
     src/voice/voice_channel.c
     src/stubs.c

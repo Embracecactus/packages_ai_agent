@@ -66,6 +66,7 @@ bool is_openai_compat_host(const char* host)
 /* Selected transport is an extension of the existing LLM client, not an
  * independent provider or turn owner. */
 static llm_transport_t s_transport;
+static llm_stream_transport_t s_stream_transport;
 static int (*s_transport_cancel)(void *);
 static void *s_transport_context;
 static unsigned int s_transport_users;
@@ -81,6 +82,13 @@ int llm_request_busy(void)
 int llm_set_transport(const char *model, const char *host,
     llm_transport_t transport, int (*cancel)(void *), void *context)
 {
+    return llm_set_transports(model, host, transport, NULL, cancel, context);
+}
+
+int llm_set_transports(const char *model, const char *host,
+    llm_transport_t transport, llm_stream_transport_t stream,
+    int (*cancel)(void *), void *context)
+{
     if (!model || !host || !transport || strlen(model) >= sizeof(s_model) ||
         strlen(host) >= sizeof(s_llm_host)) return -EINVAL;
     pthread_mutex_lock(&s_llm_lock);
@@ -91,6 +99,7 @@ int llm_set_transport(const char *model, const char *host,
      * that could silently enable the built-in path after a later clear. */
     memset(s_api_key, 0, sizeof(s_api_key));
     s_transport = transport;
+    s_stream_transport = stream;
     s_transport_cancel = cancel;
     s_transport_context = context;
     pthread_mutex_unlock(&s_llm_lock);
@@ -105,6 +114,7 @@ int llm_clear_transport(void)
         return -EBUSY;
     }
     s_transport = NULL;
+    s_stream_transport = NULL;
     s_transport_cancel = NULL;
     s_transport_context = NULL;
     memset(s_api_key, 0, sizeof(s_api_key));
@@ -124,6 +134,81 @@ int llm_cancel_request(void)
     int ret = cancel ? cancel(context) : -ENOTSUP;
     pthread_mutex_lock(&s_llm_lock);
     if (cancel) s_transport_users--;
+    pthread_mutex_unlock(&s_llm_lock);
+    return ret;
+}
+
+int llm_final_stream_supported(void)
+{
+    pthread_mutex_lock(&s_llm_lock);
+    int supported = s_stream_transport != NULL;
+    pthread_mutex_unlock(&s_llm_lock);
+    return supported;
+}
+
+static int final_stream_receive(void *context, const char *bytes, size_t length)
+{
+    int ret = llm_final_stream_feed(context, bytes, length);
+    return ret ? ret : llm_final_stream_complete(context) ? 1 : 0;
+}
+
+int llm_chat_final_stream_checked(const char *system_prompt, cJSON *messages,
+    llm_response_t *resp, llm_text_delta_t emit, void *emit_context,
+    int (*check)(void *), void *request_context)
+{
+    if (!resp) return -EINVAL;
+    memset(resp, 0, sizeof(*resp));
+    if (!system_prompt || !cJSON_IsArray(messages)) return -EINVAL;
+    char model[64], host[128];
+    pthread_mutex_lock(&s_llm_lock);
+    llm_stream_transport_t transport = s_stream_transport;
+    void *context = s_transport_context;
+    memcpy(model, s_model, sizeof(model));
+    memcpy(host, s_llm_host, sizeof(host));
+    if (transport) s_transport_users++;
+    pthread_mutex_unlock(&s_llm_lock);
+    if (!transport) return -ENOTSUP;
+
+    int ret = check ? check(request_context) : 0;
+    cJSON *body = NULL, *msgs = NULL, *system = NULL;
+    char *request = NULL;
+    llm_final_stream_t *parser = NULL;
+    if (ret) goto done;
+    body = cJSON_CreateObject();
+    msgs = cJSON_Duplicate(messages, 1);
+    system = cJSON_CreateObject();
+    if (!body || !msgs || !system) { ret = -ENOMEM; goto done; }
+    if (!cJSON_AddStringToObject(body, "model", model_name_for_api(model, host)) ||
+        !cJSON_AddBoolToObject(body, "stream", 1) ||
+        !cJSON_AddNumberToObject(body, is_openai_compat_host(host) ?
+            "max_completion_tokens" : "max_tokens", is_openai_compat_host(host) ?
+            AGENT_LLM_MAX_TOKENS_OPENAI : AGENT_LLM_MAX_TOKENS) ||
+        !cJSON_AddStringToObject(system, "role", "system") ||
+        !cJSON_AddStringToObject(system, "content", system_prompt)) {
+        ret = -ENOMEM; goto done;
+    }
+    if (!cJSON_InsertItemInArray(msgs, 0, system)) { ret = -ENOMEM; goto done; }
+    system = NULL;
+    if (!cJSON_AddItemToObject(body, "messages", msgs)) { ret = -ENOMEM; goto done; }
+    msgs = NULL;
+    request = cJSON_PrintUnformatted(body);
+    parser = llm_final_stream_new(emit, emit_context, AGENT_LLM_MAX_RESP_SIZE - 1);
+    if (!request || !parser) { ret = -ENOMEM; goto done; }
+    int status = 0;
+    ret = transport(request, final_stream_receive, parser, &status, context,
+                    check, request_context);
+    if (!ret && status != 200) ret = -EPROTO;
+    if (!ret && check) ret = check(request_context);
+    if (!ret) ret = llm_final_stream_finish(parser, &resp->text);
+    if (!ret) resp->text_len = strlen(resp->text);
+    syslog(LOG_INFO, "[%s] final SSE status=%d result=%d text_bytes=%zu\n",
+           TAG, status, ret, resp->text_len);
+done:
+    llm_final_stream_free(parser);
+    if (request) { memset(request, 0, strlen(request)); free(request); }
+    cJSON_Delete(system); cJSON_Delete(msgs); cJSON_Delete(body);
+    pthread_mutex_lock(&s_llm_lock);
+    s_transport_users--;
     pthread_mutex_unlock(&s_llm_lock);
     return ret;
 }
@@ -782,9 +867,34 @@ int llm_chat_tools(const char* system_prompt, cJSON* messages,
     return llm_chat_tools_checked(system_prompt, messages, tools_json, resp, NULL, NULL);
 }
 
+static int llm_chat_tools_impl(const char* system_prompt, cJSON* messages,
+    const char* tools_json, llm_response_t* resp,
+    int (*check)(void *), void *request_context, bool planning);
+
 int llm_chat_tools_checked(const char* system_prompt, cJSON* messages,
     const char* tools_json, llm_response_t* resp,
     int (*check)(void *), void *request_context)
+{
+    return llm_chat_tools_impl(system_prompt, messages, tools_json, resp,
+        check, request_context, false);
+}
+
+int llm_chat_plan_checked(const char *system_prompt, cJSON *messages,
+    const char *tools_json, llm_response_t *resp,
+    int (*check)(void *), void *request_context)
+{
+    int ret = llm_chat_tools_impl(system_prompt, messages, tools_json, resp,
+        check, request_context, true);
+    if (!ret && (!resp->tool_phase_complete || !resp->call_count)) {
+        llm_response_free(resp);
+        return -EPROTO;
+    }
+    return ret;
+}
+
+static int llm_chat_tools_impl(const char* system_prompt, cJSON* messages,
+    const char* tools_json, llm_response_t* resp,
+    int (*check)(void *), void *request_context, bool planning)
 {
     memset(resp, 0, sizeof(*resp));
 
@@ -910,9 +1020,19 @@ int llm_chat_tools_checked(const char* system_prompt, cJSON* messages,
 
     cJSON* choice = choices->child;
     cJSON* finish = cJSON_GetObjectItem(choice, "finish_reason");
+    /* Truncated or filtered text is not a successful assistant response. */
+    if ((planning && (!cJSON_IsString(finish) ||
+                      strcmp(finish->valuestring, "tool_calls"))) ||
+        (cJSON_IsString(finish) &&
+         (!strcmp(finish->valuestring, "length") ||
+          !strcmp(finish->valuestring, "content_filter")))) {
+        cJSON_Delete(root);
+        return -EPROTO;
+    }
 
     resp->tool_use = (finish && cJSON_IsString(finish)
         && strcmp(finish->valuestring, "tool_calls") == 0);
+    resp->tool_phase_complete = resp->tool_use;
 
     cJSON* message = cJSON_GetObjectItem(choice, "message");
 

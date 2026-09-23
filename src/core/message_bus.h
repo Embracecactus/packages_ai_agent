@@ -29,6 +29,12 @@
 
 #include "agent_compat.h"
 #include <stdint.h>
+#include <stddef.h>
+
+#define AGENT_REPLY_BEGIN 1
+#define AGENT_REPLY_DELTA 2
+#define AGENT_REPLY_END 3
+#define AGENT_REPLY_ABORT 4
 
 /** A single message travelling on the bus. */
 typedef struct {
@@ -38,12 +44,28 @@ typedef struct {
     char *image_b64;     /**< Optional base64-encoded image; receiver must free. NULL if none. */
     uint64_t request_id; /**< Optional origin-owned correlation; zero is untracked. */
     int (*request_status)(uint64_t request_id);
+    /* Atomically accept one complete body against cancellation. The owner
+     * must serialize this with cancel; -EALREADY rejects a duplicate. A later
+     * cancel may stop playback but cannot revoke accepted body history. */
+    int (*request_commit)(uint64_t request_id);
     void (*request_complete)(uint64_t request_id, int result);
+    /* Optional final-body consumer. BEGIN reserves a bounded consumer;
+     * DELTA borrows UTF-8 text; END/ABORT must join it before returning.
+     * Only Agent's committed final phase may call BEGIN/DELTA. The normal
+     * final reply still owns history and exactly one completion notification.
+     */
+    int (*reply_stream)(uint64_t request_id, int event,
+                        const char *text, size_t length);
+    int reply_stream_started;
 } agent_msg_t;
 
 /* Final reply only. Consumes content even on failure. Completion is reported
  * after channel delivery, or immediately if a reply cannot be queued. */
 int message_bus_reply(const agent_msg_t *request, char *content, int result);
+/* Called synchronously with borrowed text only after body commit succeeds.
+ * For streaming replies, END/join must also succeed before committing. */
+int message_bus_reply_with_history(const agent_msg_t *request, char *content,
+    int result, void (*history)(const agent_msg_t *, const char *));
 
 /** Free heap members (content, image_b64) of a message.
  *  Safe to call on a zeroed or already-freed message. */
