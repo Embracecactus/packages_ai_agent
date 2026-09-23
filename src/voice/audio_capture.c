@@ -30,6 +30,7 @@
 #endif
 #include <errno.h>
 #include <poll.h>
+#include <pthread.h>
 #include <media_recorder.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -44,6 +45,10 @@ static const char* TAG = "audio_cap";
 #define CAP_OPTIONS_LEN 128
 #define CAP_CLOSE_RETRY_US (50 * 1000)
 #define CAP_CLOSE_TIMEOUT_MS 5000u
+#define CAP_LOCAL_QUEUE_MS 2000u
+#define CAP_LOCAL_HISTORY_MS 400u
+#define CAP_PRODUCER_STACK 8192u
+#define CAP_STATS_SECONDS 8u
 #ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
 #define CAP_ALSA_NAME_DEFAULT "default"
 #endif
@@ -58,6 +63,18 @@ enum audio_capture_backend {
     AUDIO_CAPTURE_BACKEND_NONE = 0,
     AUDIO_CAPTURE_BACKEND_ALSA,
     AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER,
+};
+
+struct capture_stats_bucket {
+    int64_t second;
+    uint64_t first_sample;
+    uint64_t end_sample;
+    uint64_t samples;
+    uint64_t sum_squares;
+    int64_t sum;
+    uint64_t clipped;
+    uint32_t peak;
+    uint32_t max_interval_ms;
 };
 
 struct audio_capture {
@@ -78,10 +95,33 @@ struct audio_capture {
     int started;
     int route_active;
     int (*route)(int active);
+    unsigned int sample_rate;
+    pthread_mutex_t lock;
+    pthread_cond_t ready;
+    pthread_t producer;
+    unsigned char *ring;
+    size_t ring_size;
+    size_t history_bytes;
+    uint64_t written;
+    uint64_t consumed;
+    int producer_valid;
+    int stopping;
+    int stream_error;
+    int handoff;
+    int local;
+    int discard;
+    unsigned int discard_epoch;
+    uint64_t detected_sample;
+    struct capture_stats_bucket stats[CAP_STATS_SECONDS];
+    uint64_t stats_samples;
+    int64_t stats_last_receive_ms;
 };
 
 static audio_capture_t* s_active_capture;
 static int (*s_route)(int active);
+
+static int capture_read_device(audio_capture_t *cap, void *buf, size_t len);
+static void *capture_produce(void *arg);
 
 int audio_capture_set_route(int (*route)(int active))
 {
@@ -95,6 +135,119 @@ static int64_t capture_now_ms(void)
     struct timespec now;
     clock_gettime(CLOCK_MONOTONIC, &now);
     return (int64_t)now.tv_sec * 1000 + now.tv_nsec / 1000000;
+}
+
+static uint32_t capture_isqrt64(uint64_t value)
+{
+    uint64_t bit = (uint64_t)1 << 62;
+    uint64_t root = 0;
+    while (bit > value) bit >>= 2;
+    while (bit) {
+        if (value >= root + bit) {
+            value -= root + bit;
+            root = (root >> 1) + bit;
+        } else {
+            root >>= 1;
+        }
+        bit >>= 2;
+    }
+    return (uint32_t)root;
+}
+
+/* Called only after a complete PCM chunk is accepted. Ring producers hold
+ * cap->lock; direct readers follow the product's serialized owner contract. */
+static void capture_stats_add(audio_capture_t *cap, const void *pcm,
+    size_t bytes)
+{
+    if (cap->bits_per_sample != 16 || cap->requested_channels != 1 ||
+        bytes < sizeof(int16_t)) return;
+    size_t count = bytes / sizeof(int16_t);
+    int64_t now = capture_now_ms();
+    int64_t second = now / 1000;
+    struct capture_stats_bucket *bucket =
+        &cap->stats[(unsigned int)(second % CAP_STATS_SECONDS)];
+    if (bucket->second != second || !bucket->samples) {
+        memset(bucket, 0, sizeof(*bucket));
+        bucket->second = second;
+        bucket->first_sample = cap->stats_samples;
+    }
+    if (cap->stats_last_receive_ms > 0 &&
+        now > cap->stats_last_receive_ms) {
+        int64_t gap = now - cap->stats_last_receive_ms;
+        uint32_t bounded = gap > UINT32_MAX ? UINT32_MAX : (uint32_t)gap;
+        if (bounded > bucket->max_interval_ms)
+            bucket->max_interval_ms = bounded;
+    }
+    cap->stats_last_receive_ms = now;
+    const int16_t *samples = pcm;
+    for (size_t i = 0; i < count; i++) {
+        int32_t value = samples[i];
+        uint32_t magnitude = value < 0 ? (uint32_t)-value : (uint32_t)value;
+        bucket->sum += value;
+        bucket->sum_squares += (uint64_t)((int64_t)value * value);
+        if (magnitude > bucket->peak) bucket->peak = magnitude;
+        if (magnitude >= 32767) bucket->clipped++;
+    }
+    bucket->samples += count;
+    cap->stats_samples += count;
+    bucket->end_sample = cap->stats_samples;
+}
+
+static void capture_stats_snapshot(audio_capture_t *cap,
+    audio_capture_stats_t *stats)
+{
+    memset(stats, 0, sizeof(*stats));
+    int64_t now_second = capture_now_ms() / 1000;
+    uint64_t sum_squares = 0;
+    int64_t sum = 0;
+    uint64_t clipped = 0;
+    for (unsigned int i = 0; i < CAP_STATS_SECONDS; i++) {
+        const struct capture_stats_bucket *bucket = &cap->stats[i];
+        if (!bucket->samples || bucket->second > now_second ||
+            now_second - bucket->second >= CAP_STATS_SECONDS) continue;
+        if (!stats->samples || bucket->first_sample < stats->first_sample)
+            stats->first_sample = bucket->first_sample;
+        if (bucket->end_sample > stats->end_sample)
+            stats->end_sample = bucket->end_sample;
+        stats->samples += bucket->samples;
+        sum += bucket->sum;
+        sum_squares += bucket->sum_squares;
+        clipped += bucket->clipped;
+        if (bucket->peak > stats->peak) stats->peak = bucket->peak;
+        if (bucket->max_interval_ms > stats->max_receive_interval_ms)
+            stats->max_receive_interval_ms = bucket->max_interval_ms;
+    }
+    if (stats->samples) {
+        stats->rms = capture_isqrt64(sum_squares / stats->samples);
+        stats->dc = (int32_t)(sum / (int64_t)stats->samples);
+        stats->clipped_permyriad =
+            (uint32_t)(clipped * 10000 / stats->samples);
+    }
+    stats->stream_error = cap->stream_error;
+}
+
+int audio_capture_get_stats(audio_capture_t *cap,
+    audio_capture_stats_t *stats)
+{
+    if (!cap || !stats) return -EINVAL;
+    if (cap->ring) pthread_mutex_lock(&cap->lock);
+    capture_stats_snapshot(cap, stats);
+    if (cap->ring) pthread_mutex_unlock(&cap->lock);
+    return 0;
+}
+
+static void capture_stats_log(audio_capture_t *cap, const char *boundary)
+{
+    audio_capture_stats_t stats;
+    if (audio_capture_get_stats(cap, &stats) < 0) return;
+    syslog(LOG_INFO,
+        "[%s] %s raw_pcm samples=[%llu,%llu) count=%llu rms=%u peak=%u dc=%ld clipped_permyriad=%u max_receive_interval_ms=%u stream_error=%d hardware_drop=unknown\n",
+        TAG, boundary, (unsigned long long)stats.first_sample,
+        (unsigned long long)stats.end_sample,
+        (unsigned long long)stats.samples, (unsigned int)stats.rms,
+        (unsigned int)stats.peak, (long)stats.dc,
+        (unsigned int)stats.clipped_permyriad,
+        (unsigned int)stats.max_receive_interval_ms, stats.stream_error);
 }
 
 static int close_media_recorder(audio_capture_t* cap, unsigned int timeout_ms)
@@ -444,12 +597,25 @@ audio_capture_t* audio_capture_open(const char* dev_path,
     unsigned int bits_per_sample)
 {
     if (s_active_capture) {
-        syslog(LOG_WARNING, "[%s] force closing stale capture\n", TAG);
-        int ret = audio_capture_close(s_active_capture);
-        if (ret < 0) {
-            errno = -ret;
-            return NULL;
+        audio_capture_t *active = s_active_capture;
+        if (active->ring) {
+            pthread_mutex_lock(&active->lock);
+            if (active->handoff && !active->stopping &&
+                !active->stream_error && active->sample_rate == sample_rate &&
+                active->requested_channels == channels &&
+                active->bits_per_sample == bits_per_sample) {
+                active->handoff = 0;
+                active->local = 0;
+                pthread_mutex_unlock(&active->lock);
+                return active;
+            }
+            int error = active->stream_error;
+            pthread_mutex_unlock(&active->lock);
+            errno = error ? -error : EBUSY;
+        } else {
+            errno = EBUSY;
         }
+        return NULL;
     }
 
     audio_capture_t* cap = calloc(1, sizeof(*cap));
@@ -486,6 +652,50 @@ audio_capture_t* audio_capture_open(const char* dev_path,
     }
 
     s_active_capture = cap;
+    cap->sample_rate = sample_rate;
+    return cap;
+}
+
+audio_capture_t *audio_capture_open_local(const char *dev_path,
+    unsigned int sample_rate, unsigned int channels, unsigned int bits)
+{
+    if (sample_rate != 16000 || channels != 1 || bits != 16) {
+        errno = ENOTSUP;
+        return NULL;
+    }
+    if (s_active_capture) {
+        errno = EBUSY;
+        return NULL;
+    }
+    audio_capture_t *cap = audio_capture_open(dev_path, sample_rate,
+        channels, bits);
+    if (!cap) return NULL;
+    if (cap->backend != AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER) {
+        audio_capture_close(cap);
+        errno = ENOTSUP;
+        return NULL;
+    }
+    cap->ring_size = sample_rate * cap->out_frame_bytes * CAP_LOCAL_QUEUE_MS / 1000;
+    cap->history_bytes = sample_rate * cap->out_frame_bytes * CAP_LOCAL_HISTORY_MS / 1000;
+    unsigned char *ring = calloc(1, cap->ring_size);
+    if (!ring) {
+        audio_capture_close(cap);
+        errno = ENOMEM;
+        return NULL;
+    }
+    int ret = pthread_mutex_init(&cap->lock, NULL);
+    if (!ret) {
+        ret = pthread_cond_init(&cap->ready, NULL);
+        if (ret) pthread_mutex_destroy(&cap->lock);
+    }
+    if (ret) {
+        free(ring);
+        audio_capture_close(cap);
+        errno = ret;
+        return NULL;
+    }
+    cap->ring = ring;
+    cap->local = 1;
     return cap;
 }
 
@@ -494,6 +704,7 @@ int audio_capture_start(audio_capture_t* cap)
     if (!cap) {
         return -EINVAL;
     }
+    if (cap->started) return 0;
 
     switch (cap->backend) {
     case AUDIO_CAPTURE_BACKEND_ALSA:
@@ -537,6 +748,27 @@ int audio_capture_start(audio_capture_t* cap)
             return ret;
         }
 
+        cap->started = 1;
+        if (cap->ring) {
+            pthread_attr_t attr;
+            ret = pthread_attr_init(&attr);
+            if (!ret) {
+                size_t stack = CAP_PRODUCER_STACK;
+#ifdef PTHREAD_STACK_MIN
+                if (stack < PTHREAD_STACK_MIN) stack = PTHREAD_STACK_MIN;
+#endif
+                ret = pthread_attr_setstacksize(&attr, stack);
+                if (!ret)
+                    ret = pthread_create(&cap->producer, &attr, capture_produce, cap);
+                pthread_attr_destroy(&attr);
+            }
+            if (ret) {
+                cap->started = 0;
+                media_recorder_stop(cap->handle.recorder);
+                return -ret;
+            }
+            cap->producer_valid = 1;
+        }
         syslog(LOG_INFO, "[%s] media recorder capture started\n", TAG);
         return 0;
     }
@@ -546,7 +778,7 @@ int audio_capture_start(audio_capture_t* cap)
     }
 }
 
-int audio_capture_read(audio_capture_t* cap, void* buf, size_t len)
+static int capture_read_device(audio_capture_t* cap, void* buf, size_t len)
 {
     if (!cap || !buf || len == 0) {
         return -EINVAL;
@@ -576,6 +808,7 @@ int audio_capture_read(audio_capture_t* cap, void* buf, size_t len)
 
             out_len = (size_t)nframes * cap->out_frame_bytes;
             if (cap->bits_per_sample == 16) {
+                capture_stats_add(cap, buf, out_len);
                 apply_capture_gain(buf, out_len);
             }
             return (int)out_len;
@@ -597,6 +830,7 @@ int audio_capture_read(audio_capture_t* cap, void* buf, size_t len)
         downmix_interleaved_s16_to_mono(cap, buf, cap->scratch,
             (size_t)nframes);
         out_len = (size_t)nframes * cap->out_frame_bytes;
+        capture_stats_add(cap, buf, out_len);
         apply_capture_gain(buf, out_len);
         return (int)out_len;
 #else
@@ -635,7 +869,8 @@ int audio_capture_read(audio_capture_t* cap, void* buf, size_t len)
         }
 
         n = media_recorder_read_data(cap->handle.recorder, buf, len);
-        if (n > 0 && cap->bits_per_sample == 16) {
+        if (n > 0 && cap->bits_per_sample == 16 && !cap->ring) {
+            capture_stats_add(cap, buf, (size_t)n);
             apply_capture_gain(buf, (size_t)n);
         }
 
@@ -647,10 +882,256 @@ int audio_capture_read(audio_capture_t* cap, void* buf, size_t len)
     }
 }
 
+static void ring_copy(audio_capture_t *cap, uint64_t offset, void *buf,
+    size_t len, int writing)
+{
+    size_t index = offset % cap->ring_size;
+    size_t first = cap->ring_size - index;
+    if (first > len) first = len;
+    if (writing) {
+        memcpy(cap->ring + index, buf, first);
+        memcpy(cap->ring, (unsigned char *)buf + first, len - first);
+    } else {
+        memcpy(buf, cap->ring + index, first);
+        memcpy((unsigned char *)buf + first, cap->ring, len - first);
+    }
+}
+
+static void ring_clear(audio_capture_t *cap, uint64_t offset, size_t len)
+{
+    size_t index = offset % cap->ring_size;
+    size_t first = cap->ring_size - index;
+    if (first > len) first = len;
+    memset(cap->ring + index, 0, first);
+    memset(cap->ring, 0, len - first);
+}
+
+static void *capture_produce(void *arg)
+{
+    audio_capture_t *cap = arg;
+    unsigned char pcm[640];
+    size_t partial = 0;
+    unsigned int producer_epoch = 0;
+    int partial_from_discard = 0;
+    for (;;) {
+        pthread_mutex_lock(&cap->lock);
+        int stop = cap->stopping;
+        unsigned int read_epoch = cap->discard_epoch;
+        pthread_mutex_unlock(&cap->lock);
+        if (stop) break;
+        if (producer_epoch != read_epoch) {
+            if (partial) partial_from_discard = 1;
+            producer_epoch = read_epoch;
+        }
+        int n = capture_read_device(cap, pcm + partial, sizeof(pcm) - partial);
+        if (n == -EAGAIN || n == -EINTR) continue;
+        size_t bytes = n > 0 ? (size_t)n + partial : 0;
+        size_t complete = bytes - bytes % cap->out_frame_bytes;
+        pthread_mutex_lock(&cap->lock);
+        if (cap->stopping) {
+            pthread_mutex_unlock(&cap->lock);
+            break;
+        }
+        uint64_t oldest = cap->local && !cap->handoff &&
+            cap->consumed > cap->history_bytes ?
+            cap->consumed - cap->history_bytes :
+            cap->local && !cap->handoff ? 0 : cap->consumed;
+        int discard_read = cap->discard || read_epoch != cap->discard_epoch;
+        if (n <= 0 || (!discard_read &&
+            cap->written - oldest + complete > cap->ring_size)) {
+            cap->stream_error = n < 0 ? n : n == 0 ?
+                (partial ? -EPROTO : -EPIPE) : -EOVERFLOW;
+            cap->stopping = 1;
+        } else if (discard_read) {
+            cap->written += complete;
+            cap->consumed = cap->written;
+            cap->stats_samples = cap->written / cap->out_frame_bytes;
+            memset(pcm, 0, complete);
+            partial = bytes - complete;
+            if (partial) memmove(pcm, pcm + complete, partial);
+            partial_from_discard = partial != 0;
+        } else {
+            /* A byte-stream may split a PCM sample at the pause boundary.
+             * Drop that whole cross-boundary frame; never combine a speaker
+             * tail byte with the resumed conversation's first byte. */
+            if (partial_from_discard && complete >= cap->out_frame_bytes) {
+                size_t drop = cap->out_frame_bytes;
+                cap->written += drop;
+                cap->consumed = cap->written;
+                cap->stats_samples = cap->written / cap->out_frame_bytes;
+                memmove(pcm, pcm + drop, bytes - drop);
+                bytes -= drop;
+                complete -= drop;
+                partial_from_discard = 0;
+            }
+            capture_stats_add(cap, pcm, complete);
+            ring_copy(cap, cap->written, pcm, complete, 1);
+            cap->written += complete;
+            partial = bytes - complete;
+            if (partial) memmove(pcm, pcm + complete, partial);
+        }
+        stop = cap->stopping;
+        pthread_cond_broadcast(&cap->ready);
+        pthread_mutex_unlock(&cap->lock);
+        if (stop) {
+            syslog(LOG_ERR, "[%s] input stopped error=%d sample=%llu\n",
+                TAG, cap->stream_error,
+                (unsigned long long)(cap->written / cap->out_frame_bytes));
+            media_recorder_stop(cap->handle.recorder);
+            break;
+        }
+    }
+    memset(pcm, 0, sizeof(pcm));
+    return NULL;
+}
+
+static int capture_read_ring(audio_capture_t *cap, void *buf, size_t len,
+    uint64_t *first_sample, int local)
+{
+    if (!cap || !cap->ring || !buf || len < cap->out_frame_bytes)
+        return -EINVAL;
+    pthread_mutex_lock(&cap->lock);
+    if (cap->local != local || cap->handoff) {
+        pthread_mutex_unlock(&cap->lock);
+        return -EBUSY;
+    }
+    if (!cap->stopping && cap->written == cap->consumed) {
+        struct timespec until;
+        clock_gettime(CLOCK_REALTIME, &until);
+        until.tv_nsec += 100000000;
+        if (until.tv_nsec >= 1000000000) {
+            until.tv_sec++;
+            until.tv_nsec -= 1000000000;
+        }
+        pthread_cond_timedwait(&cap->ready, &cap->lock, &until);
+    }
+    int ret = cap->stream_error ? cap->stream_error :
+        cap->stopping ? -ECANCELED : -EAGAIN;
+    if (!cap->stopping && !cap->discard &&
+        cap->written > cap->consumed) {
+        size_t available = cap->written - cap->consumed;
+        if (len > available) len = available;
+        len -= len % cap->out_frame_bytes;
+        if (first_sample) *first_sample = cap->consumed / cap->out_frame_bytes;
+        ring_copy(cap, cap->consumed, buf, len, 0);
+        uint64_t old = cap->consumed;
+        cap->consumed += len;
+        if (local) {
+            uint64_t first = old > cap->history_bytes ?
+                old - cap->history_bytes : 0;
+            uint64_t end = cap->consumed > cap->history_bytes ?
+                cap->consumed - cap->history_bytes : 0;
+            ring_clear(cap, first, end - first);
+        } else {
+            ring_clear(cap, old, len);
+        }
+        ret = (int)len;
+    }
+    pthread_mutex_unlock(&cap->lock);
+    if (ret > 0 && !local) apply_capture_gain(buf, ret);
+    return ret;
+}
+
+int audio_capture_read(audio_capture_t *cap, void *buf, size_t len)
+{
+    if (cap && cap->ring) return capture_read_ring(cap, buf, len, NULL, 0);
+    int ret = capture_read_device(cap, buf, len);
+    if (cap && ret < 0 && ret != -EAGAIN && ret != -EINTR)
+        cap->stream_error = ret;
+    return ret;
+}
+
+int audio_capture_read_at(audio_capture_t *cap, void *buf, size_t len,
+    uint64_t *first_sample)
+{
+    if (!cap || !cap->ring || !first_sample) return -EINVAL;
+    return capture_read_ring(cap, buf, len, first_sample, 0);
+}
+
+int audio_capture_read_local(audio_capture_t *cap, void *buf, size_t len,
+    uint64_t *first_sample)
+{
+    return capture_read_ring(cap, buf, len, first_sample, 1);
+}
+
+int audio_capture_handoff_at(audio_capture_t *cap, uint64_t detected_sample)
+{
+    if (!cap || !cap->ring) return -EINVAL;
+    pthread_mutex_lock(&cap->lock);
+    int ret = cap->stream_error ? cap->stream_error :
+        cap->stopping ? -ECANCELED : !cap->local || cap->handoff ? -EBUSY : 0;
+    if (!ret && detected_sample != UINT64_MAX &&
+        detected_sample != cap->consumed / cap->out_frame_bytes)
+        ret = -EINVAL;
+    if (!ret) {
+        cap->detected_sample = detected_sample == UINT64_MAX ?
+            cap->consumed / cap->out_frame_bytes : detected_sample;
+        cap->consumed = cap->consumed > cap->history_bytes ?
+            cap->consumed - cap->history_bytes : 0;
+        cap->handoff = 1;
+        syslog(LOG_INFO, "[%s] handoff first_sample=%llu queued_samples=%llu\n",
+            TAG, (unsigned long long)(cap->consumed / cap->out_frame_bytes),
+            (unsigned long long)((cap->written - cap->consumed) / cap->out_frame_bytes));
+    }
+    pthread_mutex_unlock(&cap->lock);
+    if (!ret) capture_stats_log(cap, "handoff");
+    return ret;
+}
+
+int audio_capture_handoff(audio_capture_t *cap)
+{
+    return audio_capture_handoff_at(cap, UINT64_MAX);
+}
+
+int audio_capture_get_handoff_sample(audio_capture_t *cap,
+    uint64_t *detected_sample)
+{
+    if (!cap || !cap->ring || !detected_sample) return -EINVAL;
+    pthread_mutex_lock(&cap->lock);
+    int ret = cap->local || cap->handoff ? -EBUSY : 0;
+    if (!ret) *detected_sample = cap->detected_sample;
+    pthread_mutex_unlock(&cap->lock);
+    return ret;
+}
+
+int audio_capture_set_discard(audio_capture_t *cap, int discard)
+{
+    if (!cap || !cap->ring) return -EINVAL;
+    pthread_mutex_lock(&cap->lock);
+    int ret = cap->local || cap->handoff ? -EBUSY :
+        cap->stopping ? -ECANCELED : cap->stream_error;
+    if (!ret) {
+        if (discard) {
+            ring_clear(cap, cap->consumed, cap->written - cap->consumed);
+            cap->consumed = cap->written;
+        }
+        if (cap->discard != !!discard) {
+            cap->discard = !!discard;
+            cap->discard_epoch++;
+        }
+        pthread_cond_broadcast(&cap->ready);
+    }
+    pthread_mutex_unlock(&cap->lock);
+    return ret;
+}
+
 int audio_capture_abort(audio_capture_t* cap)
 {
     if (!cap) {
         return -EINVAL;
+    }
+    if (cap->ring) {
+        pthread_mutex_lock(&cap->lock);
+        cap->stopping = 1;
+        pthread_cond_broadcast(&cap->ready);
+        pthread_mutex_unlock(&cap->lock);
+        /* This reader polls at 100 ms and is the socket's sole consumer.
+         * Join before invoking recorder control or releasing its socket. */
+        if (cap->producer_valid) {
+            int joined = pthread_join(cap->producer, NULL);
+            if (joined) return -joined;
+            cap->producer_valid = 0;
+        }
     }
 
     switch (cap->backend) {
@@ -680,10 +1161,15 @@ int audio_capture_abort(audio_capture_t* cap)
     }
 }
 
-int audio_capture_close(audio_capture_t* cap)
+static int capture_close(audio_capture_t* cap, unsigned int timeout_ms)
 {
     if (!cap) {
         return 0;
+    }
+    if (!timeout_ms) return -EINVAL;
+    if (cap->ring) {
+        int ret = audio_capture_abort(cap);
+        if (ret < 0 && cap->producer_valid) return ret;
     }
 
     switch (cap->backend) {
@@ -705,7 +1191,7 @@ int audio_capture_close(audio_capture_t* cap)
     case AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER:
         if (cap->handle.recorder) {
             media_recorder_stop(cap->handle.recorder);
-            int ret = close_media_recorder(cap, CAP_CLOSE_TIMEOUT_MS);
+            int ret = close_media_recorder(cap, timeout_ms);
             if (ret < 0) return ret;
         }
         break;
@@ -714,32 +1200,41 @@ int audio_capture_close(audio_capture_t* cap)
         break;
     }
 
-    int ret = release_capture_route(cap, CAP_CLOSE_TIMEOUT_MS);
+    int ret = release_capture_route(cap, timeout_ms);
     if (ret < 0) return ret;
     if (s_active_capture == cap) {
         s_active_capture = NULL;
     }
 
+    capture_stats_log(cap, "close");
+
+    if (cap->ring) {
+        memset(cap->ring, 0, cap->ring_size);
+        free(cap->ring);
+        pthread_cond_destroy(&cap->ready);
+        pthread_mutex_destroy(&cap->lock);
+    }
     free(cap);
     syslog(LOG_INFO, "[%s] closed\n", TAG);
     return 0;
+}
+
+int audio_capture_close(audio_capture_t *cap)
+{
+    return capture_close(cap, CAP_CLOSE_TIMEOUT_MS);
 }
 
 int audio_capture_cleanup(unsigned int timeout_ms)
 {
     audio_capture_t* cap = s_active_capture;
     if (!cap) return 0;
-    if (cap->backend == AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER &&
-        cap->handle.recorder) {
-        media_recorder_stop(cap->handle.recorder);
-        int ret = close_media_recorder(cap, timeout_ms);
-        if (ret < 0) return ret;
+    if (cap->ring) {
+        pthread_mutex_lock(&cap->lock);
+        int local_owned = cap->local && !cap->handoff && cap->producer_valid;
+        pthread_mutex_unlock(&cap->lock);
+        /* A failed second open has no authority to release a live local
+         * reader. Its owner must first join it and explicitly close. */
+        if (local_owned) return -EBUSY;
     }
-    int ret = release_capture_route(cap, timeout_ms);
-    if (ret < 0) return ret;
-    if (s_active_capture == cap) s_active_capture = NULL;
-    free(cap->scratch);
-    free(cap);
-    syslog(LOG_INFO, "[%s] retained capture released\n", TAG);
-    return 0;
+    return capture_close(cap, timeout_ms);
 }

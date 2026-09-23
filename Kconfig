@@ -136,6 +136,14 @@ config AI_AGENT_AUDIO_PREPROCESS
 		ec2float for NS and compexp for AGC. Requires ~150KB
 		heap on BES platforms with HiFi4 DSP.
 
+config AI_AGENT_ADAPTIVE_ENDPOINT
+	bool "Experimental sample-clock adaptive energy endpoint"
+	default n
+	---help---
+		Use a stateful 20 ms noise-floor detector with hysteresis instead of
+		the fixed amplitude detector. Keeps the 900 ms tail until recognition
+		completeness is evaluated. Not neural VAD or echo cancellation.
+
 config AI_AGENT_AUDIO_CAPTURE_GAIN
 	int "Audio capture gain multiplier"
 	default 6

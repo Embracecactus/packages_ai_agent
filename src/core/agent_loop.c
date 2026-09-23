@@ -849,12 +849,16 @@ static char* force_finish_reply(const char* system_prompt,
 
 /* ── Extracted: dispatch response to outbound bus ─────────── */
 
+static void append_reply_history(const agent_msg_t *msg, const char *text)
+{
+    session_append(msg->chat_id, "user", msg->content);
+    session_append(msg->chat_id, "assistant", text);
+}
+
 static void dispatch_response(const agent_msg_t* msg, char* final_text)
 {
     if (final_text && final_text[0]) {
-        session_append(msg->chat_id, "user", msg->content);
-        session_append(msg->chat_id, "assistant", final_text);
-        message_bus_reply(msg, final_text, 0);
+        message_bus_reply_with_history(msg, final_text, 0, append_reply_history);
     } else if (msg->request_complete) {
         message_bus_reply(msg, final_text, -ENODATA);
     } else {
@@ -1010,9 +1014,82 @@ static int agent_request_check(void *context)
     return msg->request_status ? msg->request_status(msg->request_id) : 0;
 }
 
+/* Explicit phase transition, not a guess based on an absent tool delta.
+ * It costs a planning request; comparisons must include that request. The
+ * same Agent still owns tool authorization, history and the final reply.
+ */
+#define FINAL_PHASE_TOOL "agent_finalize"
+static char *voice_planning_tools(const char *tools)
+{
+    cJSON *array = tools ? cJSON_Parse(tools) : cJSON_CreateArray();
+    if (!cJSON_IsArray(array)) { cJSON_Delete(array); return NULL; }
+    cJSON *item;
+    cJSON_ArrayForEach(item, array) {
+        cJSON *name = cJSON_GetObjectItemCaseSensitive(item, "name");
+        if (cJSON_IsString(name) && !strcmp(name->valuestring, FINAL_PHASE_TOOL)) {
+            cJSON_Delete(array); return NULL;
+        }
+    }
+    cJSON *final = cJSON_Parse("{\"name\":\"agent_finalize\","
+        "\"description\":\"Finish tool planning only when you have sufficient information. "
+        "Call this alone with no arguments, instead of drafting an answer. "
+        "The next phase will deliver the final spoken answer.\","
+        "\"input_schema\":{\"type\":\"object\",\"properties\":{},"
+        "\"additionalProperties\":false}}");
+    if (!final || !cJSON_AddItemToArray(array, final)) {
+        cJSON_Delete(final); cJSON_Delete(array); return NULL;
+    }
+    char *result = cJSON_PrintUnformatted(array);
+    cJSON_Delete(array);
+    return result;
+}
+
+static int final_body_delta(void *context, const char *text, size_t length)
+{
+    agent_msg_t *msg = context;
+    int ret = agent_request_check(msg);
+    return ret ? ret : msg->reply_stream(msg->request_id, AGENT_REPLY_DELTA,
+                                         text, length);
+}
+
+static char *voice_final_phase(const char *system, cJSON *messages,
+    const llm_response_t *plan, agent_msg_t *msg, int *failure)
+{
+    const llm_tool_call_t *call = &plan->calls[0];
+    cJSON *args = call->input ? cJSON_ParseWithOpts(call->input, NULL, 1) : NULL;
+    if (!plan->tool_phase_complete || plan->call_count != 1 ||
+        !call->id[0] || !cJSON_IsObject(args) || args->child) {
+        cJSON_Delete(args); *failure = -EPROTO; return NULL;
+    }
+    cJSON_Delete(args);
+    add_assistant_message(messages, plan);
+    cJSON *result = cJSON_CreateObject();
+    if (!result || !cJSON_AddStringToObject(result, "role", "tool") ||
+        !cJSON_AddStringToObject(result, "tool_call_id", call->id) ||
+        !cJSON_AddStringToObject(result, "content",
+            "Tool phase completed. Give the final answer directly from the available evidence; no more tools.")) {
+        cJSON_Delete(result); *failure = -ENOMEM; return NULL;
+    }
+    if (!cJSON_AddItemToArray(messages, result)) {
+        cJSON_Delete(result); *failure = -ENOMEM; return NULL;
+    }
+    *failure = agent_request_check(msg);
+    if (!*failure) *failure = msg->reply_stream(msg->request_id, AGENT_REPLY_BEGIN, NULL, 0);
+    if (*failure) return NULL;
+    msg->reply_stream_started = 1;
+    llm_response_t response;
+    *failure = llm_chat_final_stream_checked(system, messages, &response,
+        final_body_delta, msg, agent_request_check, msg);
+    char *text = response.text;
+    response.text = NULL;
+    llm_response_free(&response);
+    if (*failure) { free(text); return NULL; }
+    return text;
+}
+
 static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     const char* tools_json, char* tool_output, size_t tool_size,
-    const agent_msg_t* msg, int *failure)
+    agent_msg_t* msg, int *failure)
 {
     *failure = 0;
     char prev_sig[512];
@@ -1027,6 +1104,26 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     prev_name[0] = '\0';
     name_repeat = 0;
     bool watchdog_fired = false;
+    const char *final_system = sys_prompt;
+    char *planning_tools = NULL;
+    char *planning_system = NULL;
+    if (msg->reply_stream && llm_final_stream_supported()) {
+        planning_tools = voice_planning_tools(tools_json);
+        const char suffix[] = "\nFor this voice turn, first use any necessary tools. "
+            "When ready, call agent_finalize alone with {} instead of writing the answer. "
+            "Never call it before required tools finish. Your final answer follows in a separate phase.";
+        planning_system = malloc(strlen(sys_prompt) + sizeof(suffix));
+        if (planning_tools && planning_system) {
+            strcpy(planning_system, sys_prompt);
+            strcat(planning_system, suffix);
+            sys_prompt = planning_system;
+            tools_json = planning_tools;
+        } else {
+            free(planning_tools); free(planning_system);
+            *failure = -ENOMEM;
+            return NULL;
+        }
+    }
 
     /* Router: select and apply best backend before first LLM call.
      * Estimate complexity from the last user message. */
@@ -1058,7 +1155,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         llm_response_t resp;
         struct timeval tv_start, tv_end;
         gettimeofday(&tv_start, NULL);
-        int err = llm_chat_tools_checked(sys_prompt, messages, tools_json, &resp,
+        int err = (planning_tools ? llm_chat_plan_checked : llm_chat_tools_checked)(
+            sys_prompt, messages, tools_json, &resp,
             agent_request_check, (void *)msg);
         gettimeofday(&tv_end, NULL);
         uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
@@ -1082,7 +1180,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                 trace.backend_idx = next_idx;
                 llm_response_free(&resp);
                 gettimeofday(&tv_start, NULL);
-                err = llm_chat_tools_checked(sys_prompt, messages,
+                err = (planning_tools ? llm_chat_plan_checked : llm_chat_tools_checked)(
+                    sys_prompt, messages,
                     tools_json, &resp, agent_request_check, (void *)msg);
                 gettimeofday(&tv_end, NULL);
                 latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
@@ -1099,7 +1198,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                 agent_trace_step(&trace, iteration, NULL,
                     latency_ms, 0);
                 llm_response_free(&resp);
-                final_text = strdup(LLM_TIMEOUT_MSG);
+                if (planning_tools) *failure = -ETIMEDOUT;
+                else final_text = strdup(LLM_TIMEOUT_MSG);
                 watchdog_fired = true;
                 break;
             }
@@ -1122,7 +1222,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                 TAG, latency_ms, AGENT_LLM_TIMEOUT_SEC);
             agent_trace_step(&trace, iteration, NULL, latency_ms, 0);
             llm_response_free(&resp);
-            final_text = strdup(LLM_TIMEOUT_MSG);
+            if (planning_tools) *failure = -ETIMEDOUT;
+            else final_text = strdup(LLM_TIMEOUT_MSG);
             watchdog_fired = true;
             break;
         }
@@ -1141,7 +1242,31 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
             "[%s] LLM resp: text=%zu, tool_use=%d, calls=%d\n",
             TAG, resp.text_len, resp.tool_use, resp.call_count);
 
+        int final_requested = 0;
+        for (int i = 0; i < resp.call_count; i++)
+            if (!strcmp(resp.calls[i].name, FINAL_PHASE_TOOL)) final_requested = 1;
+        if (planning_tools && final_requested) {
+            syslog(LOG_INFO, "[%s] final phase planning_requests=%d\n", TAG, iteration + 1);
+            agent_trace_step(&trace, iteration, FINAL_PHASE_TOOL, latency_ms, 1);
+            gettimeofday(&tv_start, NULL);
+            final_text = voice_final_phase(final_system, messages, &resp, msg, failure);
+            gettimeofday(&tv_end, NULL);
+            uint32_t final_ms = calc_elapsed_ms(&tv_start, &tv_end);
+            syslog(LOG_INFO, "[%s] final-body request=%" PRIu64 " duration_ms=%" PRIu32
+                " result=%d tokens=unknown\n", TAG, msg->request_id, final_ms, *failure);
+            agent_trace_step(&trace, iteration, "final_body", final_ms, !*failure);
+            llm_response_free(&resp);
+            break;
+        }
+
         if (!resp.tool_use) {
+            /* Planning text is never a committed final body, even if the
+             * provider reports stop. Preserve the ordinary synchronous path. */
+            if (planning_tools) {
+                llm_response_free(&resp);
+                *failure = -EPROTO;
+                break;
+            }
             /* Cascade routing: if AUTO profile selected a cheap backend
              * for a SIMPLE query but the response looks inadequate,
              * retry once with PREMIUM tier. */
@@ -1314,7 +1439,7 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
 
         /* TASK_COMPLETE detection */
         if (resp.call_count == 1 && tool_output[0]
-            && strstr(tool_output, "TASK_COMPLETE")) {
+            && strstr(tool_output, "TASK_COMPLETE") && !planning_tools) {
             syslog(LOG_INFO,
                 "[%s] Tool %s returned TASK_COMPLETE\n",
                 TAG, resp.calls[0].name);
@@ -1333,7 +1458,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
 
     /* Iteration limit reached — force a summary reply */
     if (!final_text && iteration >= AGENT_AI_AGENT_MAX_TOOL_ITER) {
-        final_text = force_finish_reply(sys_prompt, messages, msg);
+        if (planning_tools) *failure = -ELOOP;
+        else final_text = force_finish_reply(sys_prompt, messages, msg);
         agent_trace_end(&trace, AGENT_TRACE_TIMEOUT);
     } else if (watchdog_fired) {
         agent_trace_end(&trace, AGENT_TRACE_TIMEOUT);
@@ -1343,6 +1469,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         agent_trace_end(&trace, AGENT_TRACE_FAIL);
     }
 
+    free(planning_tools);
+    free(planning_system);
     return final_text;
 }
 

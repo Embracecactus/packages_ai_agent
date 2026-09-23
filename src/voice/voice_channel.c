@@ -25,6 +25,7 @@
 #include "agent_compat.h"
 #include "agent_config.h"
 #include "voice/audio_capture.h"
+#include "voice/voice_endpoint.h"
 #include "voice/audio_playback.h"
 #include "voice/voice_asr.h"
 #include "voice/voice_tts.h"
@@ -52,6 +53,10 @@ static const char* TAG = "voice";
 #define AUTO_PCM_BYTES (AUTO_ENDPOINT_MAX_MS * (AGENT_VOICE_SAMPLE_RATE / 1000u) * AGENT_VOICE_CHANNELS * (AGENT_VOICE_BITS / 8u))
 #define AUTO_ENDPOINT_MIN_SPEECH_MS 200u
 #define AUTO_ENDPOINT_MEAN_ABS 180u
+#define AUTO_WAKE_QUIET_MS 300u
+#define AUTO_WAKE_ACTIVE_MS 200u
+#define AUTO_WAKE_TAIL_GUARD_MS 250u
+#define AUTO_WAKE_GATE_BYTES (AGENT_VOICE_SAMPLE_RATE * 2u * 2u)
 static int s_backends_registered;
 
 /* ── Audio preprocessing (NS + AGC via BES ec2float) ────── */
@@ -229,14 +234,20 @@ static struct {
     int capture_error;
     atomic_int tts_abort; /* set to 1 to stop active TTS playback */
     int tts_active;
+    int reply_stream_active;
     audio_playback_t* tts_pb; /* active TTS playback handle (or NULL) */
     pthread_mutex_t speak_lock; /* serialize concurrent speak calls */
     int auto_endpoint;
+    int wake_ack_pending;
+    int wake_ack_result;
     sem_t rec_done;
     int initialized;
     int turn_active;
     int canceled;
+    int reply_committed;
     int cleanup_in_progress;
+    int preconnect_active;
+    uint64_t start_generation;
     int capture_cleanup_pending;
     int capture_cleanup_result;
     int tts_cleanup_pending;
@@ -410,6 +421,21 @@ static int voice_request_status(uint64_t id)
 static int voice_request_check(void *request)
 { return voice_request_status(*(const uint64_t *)request); }
 
+static int voice_request_commit(uint64_t id)
+{
+    /* This is the complete-body/history linearization point, not permission
+     * to ignore a later playback interruption. Cancel holds this same lock. */
+    pthread_mutex_lock(&s_voice.lock);
+    int ret = !s_voice.turn_active || id != s_voice.request_id ? -ESTALE :
+        s_voice.reply_committed ? -EALREADY :
+        s_voice.canceled ? -ECANCELED :
+        voice_now_ms() - s_voice.turn_started_ms >= AUTO_TURN_TIMEOUT_MS ?
+        -ETIMEDOUT : 0;
+    if (!ret) s_voice.reply_committed = 1;
+    pthread_mutex_unlock(&s_voice.lock);
+    return ret;
+}
+
 static void voice_request_complete(uint64_t id, int result)
 {
     pthread_mutex_lock(&s_voice.lock);
@@ -418,7 +444,8 @@ static void voice_request_complete(uint64_t id, int result)
         return;
     }
     /* Completion is called only by the current resource owner after cleanup. */
-    if (s_voice.cap || s_voice.tts_active ||
+    if (s_voice.cap || s_voice.tts_active || s_voice.reply_stream_active ||
+        s_voice.preconnect_active ||
         s_voice.capture_cleanup_pending || s_voice.tts_cleanup_pending ||
         s_voice.state == VOICE_STOPPING) {
         pthread_mutex_unlock(&s_voice.lock);
@@ -427,6 +454,8 @@ static void voice_request_complete(uint64_t id, int result)
     if (s_voice.canceled) result = -ECANCELED;
     s_voice.turn_active = 0;
     s_voice.auto_endpoint = 0;
+    s_voice.wake_ack_pending = 0;
+    s_voice.wake_ack_result = 0;
     s_voice.state = VOICE_IDLE;
     pthread_mutex_unlock(&s_voice.lock);
     syslog(LOG_INFO, "[%s] request=%llu complete=%d\n", TAG,
@@ -435,6 +464,120 @@ static void voice_request_complete(uint64_t id, int result)
 }
 
 static int voice_channel_start_internal(int automatic);
+static int voice_channel_reply_stream(uint64_t id, int event,
+    const char* text, size_t length);
+
+/* The KWS reports a detection frame, not a word-end timestamp. Keep its
+ * bounded pre-roll until new PCM decides the path. This favors preserving an
+ * immediate command; a long wake-word tail remains an unavoidable ambiguity. */
+static int wake_ack_gate(audio_capture_t *cap, uint64_t id,
+    unsigned char **replay, size_t *replay_len)
+{
+    uint64_t detected_sample;
+    int ret = audio_capture_get_handoff_sample(cap, &detected_sample);
+    if (ret < 0) return ret;
+    unsigned char *buffer = malloc(AUTO_WAKE_GATE_BYTES);
+    if (!buffer) return -ENOMEM;
+    size_t used = 0;
+    unsigned int active_ms = 0, quiet_ms = 0, new_onset_ms = 0;
+    int had_quiet = 0, command = 0;
+    uint64_t deadline = voice_now_ms() + 1500u;
+    while (!command && quiet_ms < AUTO_WAKE_QUIET_MS) {
+        ret = voice_request_status(id);
+        if (ret < 0) goto fail;
+        if (voice_now_ms() >= deadline ||
+            used + 640u > AUTO_WAKE_GATE_BYTES) {
+            if (!active_ms) { ret = -ETIMEDOUT; goto fail; }
+            command = 1;
+            break;
+        }
+        unsigned char chunk[640];
+        uint64_t first_sample = 0;
+        int n = audio_capture_read_at(cap, chunk, sizeof(chunk), &first_sample);
+        if (n == -EAGAIN || n == -EINTR) continue;
+        if (n <= 0) { ret = n < 0 ? n : -EPIPE; goto fail; }
+        if (used + (size_t)n > AUTO_WAKE_GATE_BYTES) {
+            ret = -EOVERFLOW;
+            goto fail;
+        }
+        memcpy(buffer + used, chunk, (size_t)n);
+        used += (size_t)n;
+        size_t samples = (size_t)n / sizeof(int16_t);
+        size_t start = first_sample < detected_sample ?
+            (size_t)(detected_sample - first_sample) : 0;
+        if (start > samples) start = samples;
+        const int16_t *pcm = (const int16_t *)chunk;
+        for (size_t off = start; off + 160u <= samples; off += 160u) {
+            uint32_t sum = 0;
+            for (size_t i = 0; i < 160u; i++) {
+                int32_t value = pcm[off + i];
+                sum += (uint32_t)(value < 0 ? -value : value);
+            }
+            if (sum / 160u >= AUTO_ENDPOINT_MEAN_ABS) {
+                active_ms += 10u;
+                quiet_ms = 0;
+                if (had_quiet) new_onset_ms += 10u;
+                if (active_ms >= AUTO_WAKE_ACTIVE_MS ||
+                    new_onset_ms >= 40u) { command = 1; break; }
+            } else {
+                quiet_ms += 10u;
+                new_onset_ms = 0;
+                if (quiet_ms >= 80u) had_quiet = 1;
+            }
+        }
+    }
+    ret = voice_request_status(id);
+    if (ret < 0) goto fail;
+    if (command) {
+        pthread_mutex_lock(&s_voice.lock);
+        s_voice.wake_ack_pending = 0;
+        pthread_mutex_unlock(&s_voice.lock);
+        notify_channel_event(VOICE_CHANNEL_EVENT_WAKE_ACK_SKIP, 0);
+        *replay = buffer;
+        *replay_len = used;
+        return 1;
+    }
+
+    ret = audio_capture_set_discard(cap, 1);
+    if (ret < 0) goto fail;
+    memset(buffer, 0, used);
+    free(buffer);
+    pthread_mutex_lock(&s_voice.lock);
+    s_voice.wake_ack_result = -EINPROGRESS;
+    pthread_mutex_unlock(&s_voice.lock);
+    /* Synchronous callback: the sole reader cannot resume until playback
+     * drains, while the producer keeps draining and erasing microphone PCM. */
+    notify_channel_event(VOICE_CHANNEL_EVENT_WAKE_ACK_REQUEST, 0);
+    pthread_mutex_lock(&s_voice.lock);
+    ret = s_voice.wake_ack_result;
+    s_voice.wake_ack_pending = 0;
+    pthread_mutex_unlock(&s_voice.lock);
+    if (ret == -EINPROGRESS) ret = -EIO;
+    if (ret >= 0) {
+        for (unsigned int ms = 0; ms < AUTO_WAKE_TAIL_GUARD_MS; ms += 10u) {
+            ret = voice_request_status(id);
+            if (ret < 0) break;
+            usleep(10000);
+        }
+    }
+    if (ret >= 0) ret = audio_capture_set_discard(cap, 0);
+    if (ret < 0)
+        notify_channel_event(VOICE_CHANNEL_EVENT_WAKE_ACK_CANCEL, 0);
+    return ret;
+fail:
+    memset(buffer, 0, used);
+    free(buffer);
+    notify_channel_event(VOICE_CHANNEL_EVENT_WAKE_ACK_CANCEL, 0);
+    return ret;
+}
+
+void voice_channel_wake_ack_result(int result)
+{
+    pthread_mutex_lock(&s_voice.lock);
+    if (s_voice.wake_ack_result == -EINPROGRESS)
+        s_voice.wake_ack_result = result;
+    pthread_mutex_unlock(&s_voice.lock);
+}
 
 static void* auto_finalize_task(void* arg)
 {
@@ -457,7 +600,9 @@ static void* auto_finalize_task(void* arg)
         strncpy(msg.chat_id, "voice", sizeof(msg.chat_id) - 1);
         msg.request_id = id;
         msg.request_status = voice_request_status;
+        msg.request_commit = voice_request_commit;
         msg.request_complete = voice_request_complete;
+        msg.reply_stream = voice_channel_reply_stream;
         msg.content = strdup(text);
         ret = msg.content ? message_bus_push_inbound(&msg) : -ENOMEM;
         if (ret != 0) free(msg.content);
@@ -478,6 +623,15 @@ static void* recording_thread(void* arg)
     int chunk_count = 0;
     int abnormal_exit = 0;
     unsigned int recorded_ms = 0, speech_ms = 0, silence_ms = 0;
+    const size_t onset_capacity = AGENT_VOICE_SAMPLE_RATE * 2u * 400u / 1000u;
+    unsigned char *onset = s_voice.auto_endpoint ? malloc(onset_capacity) : NULL;
+    size_t onset_size = 0;
+    int onset_sent = 0;
+#ifdef CONFIG_AI_AGENT_ADAPTIVE_ENDPOINT
+    voice_endpoint_t detector;
+    (void)voice_endpoint_init(&detector, AGENT_VOICE_SAMPLE_RATE,
+                             AUTO_ENDPOINT_SILENCE_MS);
+#endif
     uint64_t started_ms = voice_now_ms();
     uint64_t last_data_ms = started_ms;
 
@@ -488,7 +642,19 @@ static void* recording_thread(void* arg)
     pthread_mutex_lock(&s_voice.lock);
     voice_asr_stream_t* stream = s_voice.asr_stream;
     s_voice.asr_stream = NULL; /* thread now owns it */
+    int wake_ack_pending = s_voice.wake_ack_pending;
+    uint64_t request_id = s_voice.request_id;
     pthread_mutex_unlock(&s_voice.lock);
+
+    if (s_voice.auto_endpoint && !onset) {
+        if (stream) voice_asr_stream_abort(stream);
+        pthread_mutex_lock(&s_voice.lock);
+        s_voice.capture_error = -ENOMEM;
+        pthread_mutex_unlock(&s_voice.lock);
+        sem_post(&s_voice.rec_ready);
+        sem_post(&s_voice.rec_done);
+        return NULL;
+    }
 
     if (!stream) {
         syslog(LOG_INFO, "[%s] ASR mode=batch\n", TAG);
@@ -499,6 +665,7 @@ static void* recording_thread(void* arg)
         if (allocation != 0) {
             s_voice.capture_error = allocation;
             pthread_mutex_unlock(&s_voice.lock);
+            free(onset);
             sem_post(&s_voice.rec_ready);
             sem_post(&s_voice.rec_done);
             return NULL;
@@ -511,6 +678,24 @@ static void* recording_thread(void* arg)
     /* Signal voice_channel_start() that we are ready to consume
      * audio frames. Without this, sem_wait in start() deadlocks. */
     sem_post(&s_voice.rec_ready);
+
+    unsigned char *wake_replay = NULL;
+    size_t wake_replay_len = 0, wake_replay_offset = 0;
+    if (wake_ack_pending) {
+        int gate = wake_ack_gate(s_voice.cap, request_id,
+            &wake_replay, &wake_replay_len);
+        if (gate < 0) {
+            pthread_mutex_lock(&s_voice.lock);
+            if (!s_voice.capture_error) s_voice.capture_error = gate;
+            pthread_mutex_unlock(&s_voice.lock);
+            abnormal_exit = 1;
+            goto recording_done;
+        }
+        if (gate == 0) {
+            started_ms = voice_now_ms();
+            last_data_ms = started_ms;
+        }
+    }
 
     /* No flush needed: the new start sequence guarantees that
      * audio_capture_start() runs AFTER this thread is ready,
@@ -543,8 +728,21 @@ static void* recording_thread(void* arg)
             break;
         }
 
-        int n = audio_capture_read(s_voice.cap,
-            chunk, sizeof(chunk));
+        int n;
+        if (wake_replay_offset < wake_replay_len) {
+            size_t bytes = wake_replay_len - wake_replay_offset;
+            if (bytes > sizeof(chunk)) bytes = sizeof(chunk);
+            memcpy(chunk, wake_replay + wake_replay_offset, bytes);
+            wake_replay_offset += bytes;
+            n = (int)bytes;
+        } else {
+            if (wake_replay) {
+                memset(wake_replay, 0, wake_replay_len);
+                free(wake_replay);
+                wake_replay = NULL;
+            }
+            n = audio_capture_read(s_voice.cap, chunk, sizeof(chunk));
+        }
 
         if (n == -EAGAIN || n == -EWOULDBLOCK) {
             /* Non-blocking capture socket has no data yet (common right
@@ -557,6 +755,10 @@ static void* recording_thread(void* arg)
         if (n <= 0) {
             syslog(LOG_WARNING,
                 "[%s] capture read returned %d, stopping\n", TAG, n);
+            pthread_mutex_lock(&s_voice.lock);
+            if (!s_voice.capture_error)
+                s_voice.capture_error = n < 0 ? n : -EPIPE;
+            pthread_mutex_unlock(&s_voice.lock);
             abnormal_exit = 1;
             break;
         }
@@ -609,13 +811,59 @@ static void* recording_thread(void* arg)
             }
             unsigned int chunk_ms = samples_count * 1000u / AGENT_VOICE_SAMPLE_RATE;
             unsigned int mean = samples_count ? sum / samples_count : 0;
-            /* Waiting silence consumes time, not upload memory. */
-            if (!speech_ms && mean < AUTO_ENDPOINT_MEAN_ABS) continue;
+#ifdef CONFIG_AI_AGENT_ADAPTIVE_ENDPOINT
+            int detected = voice_endpoint_feed(&detector, samples, samples_count);
+            speech_ms = detector.speech_samples * 1000u / AGENT_VOICE_SAMPLE_RATE;
+            endpoint = detected == 2;
+            int active = detected > 0;
+            (void)mean;
+#else
+            int active = speech_ms || mean >= AUTO_ENDPOINT_MEAN_ABS;
+#endif
+            if (!onset_sent) {
+                /* Keep quiet leading syllables locally instead of discarding
+                 * every sub-threshold frame. Upload once after speech starts. */
+                size_t keep = (size_t)n < onset_capacity ? (size_t)n : onset_capacity;
+                if (onset_size + keep > onset_capacity) {
+                    size_t remove = onset_size + keep - onset_capacity;
+                    memmove(onset, onset + remove, onset_size - remove);
+                    onset_size -= remove;
+                }
+                memcpy(onset + onset_size, chunk + n - keep, keep);
+                onset_size += keep;
+                if (!active) continue;
+                int sent = 0;
+                for (size_t off = 0; off < onset_size && !sent;) {
+                    size_t bytes = onset_size - off;
+                    if (bytes > sizeof(chunk)) bytes = sizeof(chunk);
+                    sent = process_audio_chunk(&stream, onset + off, bytes,
+                                               &need_fallback, &total_bytes_sent);
+                    off += bytes;
+                }
+                memset(onset, 0, onset_size);
+                onset_sent = 1;
+                if (sent) {
+                    pthread_mutex_lock(&s_voice.lock);
+                    s_voice.capture_error = sent;
+                    pthread_mutex_unlock(&s_voice.lock);
+                    abnormal_exit = 1;
+                    break;
+                }
+                recorded_ms = onset_size * 1000u / (AGENT_VOICE_SAMPLE_RATE * 2u);
+#ifndef CONFIG_AI_AGENT_ADAPTIVE_ENDPOINT
+                speech_ms += chunk_ms;
+#endif
+                continue; /* This chunk was already included in onset. */
+            }
             recorded_ms += chunk_ms;
+#ifndef CONFIG_AI_AGENT_ADAPTIVE_ENDPOINT
             if (mean >= AUTO_ENDPOINT_MEAN_ABS) { speech_ms += chunk_ms; silence_ms = 0; }
             else silence_ms += chunk_ms;
             endpoint = speech_ms >= AUTO_ENDPOINT_MIN_SPEECH_MS &&
                 silence_ms >= AUTO_ENDPOINT_SILENCE_MS;
+#else
+            (void)silence_ms;
+#endif
             if (recorded_ms > AUTO_ENDPOINT_MAX_MS ||
                 (recorded_ms == AUTO_ENDPOINT_MAX_MS && !endpoint)) {
                 pthread_mutex_lock(&s_voice.lock);
@@ -636,6 +884,11 @@ static void* recording_thread(void* arg)
         if (endpoint) break;
     }
 
+recording_done:
+    if (wake_replay) {
+        memset(wake_replay, 0, wake_replay_len);
+        free(wake_replay);
+    }
 #ifdef CONFIG_AI_AGENT_AUDIO_PREPROCESS
     preproc_destroy(pp);
 #endif
@@ -659,6 +912,7 @@ static void* recording_thread(void* arg)
         "[%s] recording thread exit: %d chunks, %zu read, %zu sent%s\n",
         TAG, chunk_count, total_bytes_read, total_bytes_sent,
         abnormal_exit ? " (abnormal)" : "");
+    if (onset) { memset(onset, 0, onset_capacity); free(onset); }
     sem_post(&s_voice.rec_done);
     return NULL;
 }
@@ -869,6 +1123,11 @@ static void tts_queue_receive(const unsigned char* pcm, size_t len,
         if (ret || !caps.sample_rate || caps.bits != 16 ||
             (caps.channels != 1 && caps.channels != 2)) {
             atomic_store(&q->error, ret ? ret : -ENOTSUP);
+        } else if (q->output->pb &&
+            (q->output->format.sample_rate != caps.sample_rate ||
+             q->output->format.channels != caps.channels ||
+             q->output->format.bits != caps.bits)) {
+            atomic_store(&q->error, -ENOTSUP);
         } else {
             caps.batch_sample_rate = caps.sample_rate;
             q->output->format = caps;
@@ -958,6 +1217,63 @@ static int tts_speak_queued(const char* text, tts_output_t* output,
     return ret;
 }
 
+/* One Media owner covers every sentence in a streamed final reply. */
+static int tts_release_output(tts_output_t* output, int ret)
+{
+    if (output->error) ret = output->error;
+    if (ret == 0 && (!output->terminal || !output->pb)) ret = -EPROTO;
+    if (output->pb && !atomic_load(&s_voice.tts_abort)) {
+        int drained = audio_playback_drain(output->pb, 120000);
+        if (ret == 0) ret = drained;
+    }
+    pthread_mutex_lock(&s_voice.lock);
+    s_voice.tts_pb = NULL;
+    pthread_mutex_unlock(&s_voice.lock);
+    int closed_handle = audio_playback_close(output->pb);
+    int cleanup = audio_playback_cleanup(5000);
+    if (cleanup == 0 && closed_handle < 0) closed_handle = 0;
+    if (ret == 0) ret = cleanup ? cleanup : closed_handle;
+    pthread_mutex_lock(&s_voice.lock);
+    if (cleanup == 0 && closed_handle == 0) {
+        s_voice.tts_active = 0;
+        s_voice.tts_abort = 0;
+    } else {
+        s_voice.tts_cleanup_pending = 1;
+        s_voice.tts_cleanup_result = ret ? ret :
+            (cleanup ? cleanup : closed_handle);
+    }
+    pthread_mutex_unlock(&s_voice.lock);
+    return ret;
+}
+
+#define REPLY_TEXT_QUEUE_BYTES 2048
+#define REPLY_SENTENCE_BYTES 320
+#define REPLY_IDLE_FLUSH_MS 300
+
+static struct {
+    pthread_mutex_t lock;
+    pthread_cond_t changed;
+    pthread_t worker;
+    uint64_t id;
+    unsigned char queue[REPLY_TEXT_QUEUE_BYTES];
+    size_t head;
+    size_t size;
+    int active;
+    int done;
+    int abort;
+    int error;
+} s_reply = {
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+    .changed = PTHREAD_COND_INITIALIZER,
+};
+
+static void reply_wake(void)
+{
+    pthread_mutex_lock(&s_reply.lock);
+    pthread_cond_broadcast(&s_reply.changed);
+    pthread_mutex_unlock(&s_reply.lock);
+}
+
 /* ── Public API ──────────────────────────────────────────── */
 
 int voice_channel_init(void)
@@ -974,12 +1290,17 @@ int voice_channel_init(void)
     s_voice.capture_error = 0;
     s_voice.tts_abort = 0;
     s_voice.tts_active = 0;
+    s_voice.reply_stream_active = 0;
     s_voice.tts_pb = NULL;
     s_voice.auto_endpoint = 0;
+    s_voice.wake_ack_pending = 0;
+    s_voice.wake_ack_result = 0;
     s_voice.turn_active = 0;
     s_voice.canceled = 0;
+    s_voice.reply_committed = 0;
     s_voice.turn_started_ms = 0;
     s_voice.cleanup_in_progress = 0;
+    s_voice.preconnect_active = 0;
     s_voice.capture_cleanup_pending = 0;
     s_voice.capture_cleanup_result = 0;
     s_voice.tts_cleanup_pending = 0;
@@ -1011,6 +1332,41 @@ int voice_channel_init(void)
     s_voice.initialized = 1;
     pthread_mutex_unlock(&s_voice.lock);
     notify_channel_event(VOICE_CHANNEL_EVENT_INITIALIZED, 0);
+    return 0;
+}
+
+/* Called with the state lock held; returns with it held. The startup owner
+ * keeps the session reserved until a connected stream is installed or closed. */
+static int voice_preconnect_locked(int automatic, uint64_t generation,
+    uint64_t request_id, voice_asr_stream_t** stream)
+{
+    if (!voice_asr_stream_supported()) return 0;
+
+    s_voice.preconnect_active = 1;
+    pthread_mutex_unlock(&s_voice.lock);
+    voice_asr_stream_t* opened = voice_asr_stream_open();
+    int open_error = errno ? -errno : -EIO;
+    pthread_mutex_lock(&s_voice.lock);
+    int stale = generation != s_voice.start_generation ||
+        s_voice.state != VOICE_STARTING ||
+        (automatic && (!s_voice.turn_active ||
+                       request_id != s_voice.request_id));
+    int canceled = s_voice.canceled;
+    if (stale || canceled || !opened) {
+        pthread_mutex_unlock(&s_voice.lock);
+        if (opened) voice_asr_stream_abort(opened);
+        pthread_mutex_lock(&s_voice.lock);
+        if (generation == s_voice.start_generation) {
+            s_voice.preconnect_active = 0;
+            if (s_voice.state == VOICE_STARTING)
+                s_voice.state = s_voice.turn_active ?
+                    VOICE_PROCESSING : VOICE_IDLE;
+        }
+        return stale ? -ESTALE : canceled ? -ECANCELED : open_error;
+    }
+
+    s_voice.preconnect_active = 0;
+    *stream = opened;
     return 0;
 }
 
@@ -1068,6 +1424,16 @@ static int voice_channel_start_internal(int automatic)
 
     /* Batch-only backends retain the complete recording. Streaming failures
      * are terminal because earlier PCM is not buffered. */
+    if (automatic && s_voice.canceled) {
+        pthread_mutex_unlock(&s_voice.lock);
+        return -ECANCELED;
+    }
+    if (!automatic) s_voice.canceled = 0;
+    s_voice.state = VOICE_STARTING;
+    s_voice.start_generation++;
+    if (!s_voice.start_generation) s_voice.start_generation++;
+    uint64_t generation = s_voice.start_generation;
+    uint64_t request_id = s_voice.request_id;
     while (sem_trywait(&s_voice.rec_done) == 0) {}
     s_voice.auto_endpoint = automatic;
     s_voice.pcm_cap = automatic ? AUTO_PCM_BYTES : AGENT_VOICE_PCM_BUF_SIZE;
@@ -1078,13 +1444,11 @@ static int voice_channel_start_internal(int automatic)
     /* Prepare only supported streaming backends before capture. */
     s_voice.capture_error = 0;
     voice_asr_stream_t* pre_stream = NULL;
-    if (voice_asr_stream_supported()) {
-        pre_stream = voice_asr_stream_open();
-        if (!pre_stream) {
-            int error = errno;
-            pthread_mutex_unlock(&s_voice.lock);
-            return -error;
-        }
+    int connect_error = voice_preconnect_locked(automatic, generation,
+        request_id, &pre_stream);
+    if (connect_error) {
+        pthread_mutex_unlock(&s_voice.lock);
+        return connect_error;
     }
     if (pre_stream) {
         syslog(LOG_INFO, "[%s] ASR pre-connected\n", TAG);
@@ -1216,7 +1580,7 @@ int voice_channel_start(void)
     return voice_channel_start_internal(0);
 }
 
-int voice_channel_start_auto(void)
+static int voice_channel_start_auto_mode(int wake_ack)
 {
     pthread_mutex_lock(&s_voice.lock);
     if (!s_voice.initialized || s_voice.turn_active || s_voice.state != VOICE_IDLE ||
@@ -1227,6 +1591,9 @@ int voice_channel_start_auto(void)
     s_voice.state = VOICE_STARTING;
     s_voice.turn_active = 1;
     s_voice.canceled = 0;
+    s_voice.reply_committed = 0;
+    s_voice.wake_ack_pending = wake_ack;
+    s_voice.wake_ack_result = 0;
     s_voice.request_id++;
     if (!s_voice.request_id) s_voice.request_id++;
     s_voice.turn_started_ms = voice_now_ms();
@@ -1236,6 +1603,16 @@ int voice_channel_start_auto(void)
         NULL, AGENT_VOICE_PRIO);
     if (ret != OK) voice_request_complete(id, ret < 0 ? ret : -EIO);
     return ret;
+}
+
+int voice_channel_start_auto(void)
+{
+    return voice_channel_start_auto_mode(0);
+}
+
+int voice_channel_start_auto_wake(void)
+{
+    return voice_channel_start_auto_mode(1);
 }
 
 int voice_channel_is_idle(void)
@@ -1250,12 +1627,19 @@ int voice_channel_is_idle(void)
 int voice_channel_cancel(void)
 {
     pthread_mutex_lock(&s_voice.lock);
-    if (!s_voice.turn_active) { pthread_mutex_unlock(&s_voice.lock); return -ENOENT; }
+    if (!s_voice.turn_active &&
+        !(s_voice.state == VOICE_STARTING && s_voice.preconnect_active)) {
+        pthread_mutex_unlock(&s_voice.lock);
+        return -ENOENT;
+    }
     s_voice.canceled = 1;
+    s_voice.wake_ack_pending = 0;
     s_voice.tts_abort = 1;
     if (s_voice.cap) audio_capture_abort(s_voice.cap);
     if (s_voice.tts_pb) audio_playback_stop(s_voice.tts_pb);
     pthread_mutex_unlock(&s_voice.lock);
+    notify_channel_event(VOICE_CHANNEL_EVENT_WAKE_ACK_CANCEL, 0);
+    reply_wake();
     voice_asr_cancel();
     voice_tts_cancel();
     llm_cancel_request();
@@ -1349,6 +1733,7 @@ int voice_channel_stop(void)
     }
     s_voice.turn_active = 1;
     s_voice.canceled = 0;
+    s_voice.reply_committed = 0;
     s_voice.request_id++;
     if (!s_voice.request_id) s_voice.request_id++;
     s_voice.turn_started_ms = voice_now_ms();
@@ -1362,7 +1747,9 @@ int voice_channel_stop(void)
         strncpy(msg.chat_id, "voice", sizeof(msg.chat_id) - 1);
         msg.request_id = id;
         msg.request_status = voice_request_status;
+        msg.request_commit = voice_request_commit;
         msg.request_complete = voice_request_complete;
+        msg.reply_stream = voice_channel_reply_stream;
         msg.content = strdup(text);
         ret = msg.content ? message_bus_push_inbound(&msg) : -ENOMEM;
         if (ret) free(msg.content);
@@ -1398,6 +1785,10 @@ int voice_channel_stop_with_text(char* text_out, size_t text_cap)
     s_voice.asr_stream = NULL;
     pthread_mutex_unlock(&s_voice.lock);
     int close_ret = audio_capture_close(cap);
+    if (close_ret == 0 && ret == 0) {
+        notify_channel_event(VOICE_CHANNEL_EVENT_CAPTURE_QUIESCENT, 0);
+        if (tracked) ret = voice_request_status(id);
+    }
     if (close_ret < 0) {
         syslog(LOG_ERR, "[%s] capture owner retained: %d\n",
             TAG, close_ret);
@@ -1478,6 +1869,226 @@ static void tts_strip_markdown(char* s)
     *w = '\0';
 }
 
+static int reply_boundary(const char* text, size_t len)
+{
+    if (!len) return 0;
+    unsigned char last = (unsigned char)text[len - 1];
+    if (last == '.' || last == ';') return len >= 18;
+    if (last == '!' || last == '?' || last == '\n') return len >= 6;
+    if (len >= 3 &&
+        (!memcmp(text + len - 3, "。", 3) ||
+         !memcmp(text + len - 3, "！", 3) ||
+         !memcmp(text + len - 3, "？", 3) ||
+         !memcmp(text + len - 3, "；", 3))) return len >= 6;
+    if (len >= 24 &&
+        (last == ',' || !memcmp(text + len - 3, "，", 3))) return 1;
+    return 0;
+}
+
+static void reply_wait_locked(unsigned int ms)
+{
+    struct timespec until;
+    clock_gettime(CLOCK_REALTIME, &until);
+    until.tv_nsec += (long)ms * 1000000L;
+    until.tv_sec += until.tv_nsec / 1000000000L;
+    until.tv_nsec %= 1000000000L;
+    (void)pthread_cond_timedwait(&s_reply.changed, &s_reply.lock, &until);
+}
+
+static void* reply_text_worker(void* unused)
+{
+    (void)unused;
+    char sentence[REPLY_SENTENCE_BYTES + 1];
+    size_t length = 0;
+    int utf8_need = 0, spoken = 0, ret = 0;
+    unsigned char utf8_min = 0x80, utf8_max = 0xbf;
+    uint64_t id = s_reply.id;
+    tts_output_t output = {0};
+    pthread_mutex_lock(&s_voice.speak_lock);
+    pthread_mutex_lock(&s_voice.lock);
+    if (s_voice.request_id != id || !s_voice.turn_active || s_voice.canceled ||
+        s_voice.state != VOICE_SPEAKING) ret = -ECANCELED;
+    else {
+        s_voice.tts_active = 1;
+        s_voice.tts_abort = 0;
+    }
+    pthread_mutex_unlock(&s_voice.lock);
+    if (ret) goto finish;
+    clock_gettime(CLOCK_MONOTONIC, &s_tts_start);
+    s_tts_first_chunk = 0;
+
+    for (;;) {
+        int flush = 0, done = 0;
+        pthread_mutex_lock(&s_reply.lock);
+        if (s_reply.abort) ret = -ECANCELED;
+        if (!ret) ret = voice_request_status(id);
+        if (!ret && s_reply.size) {
+            unsigned char byte = s_reply.queue[s_reply.head];
+            s_reply.head = (s_reply.head + 1) % REPLY_TEXT_QUEUE_BYTES;
+            s_reply.size--;
+            pthread_cond_broadcast(&s_reply.changed);
+            if (length == REPLY_SENTENCE_BYTES) ret = -EOVERFLOW;
+            else {
+                sentence[length++] = (char)byte;
+                if (utf8_need) {
+                    if (byte < utf8_min || byte > utf8_max) ret = -EPROTO;
+                    else {
+                        utf8_need--;
+                        utf8_min = 0x80;
+                        utf8_max = 0xbf;
+                    }
+                } else if (byte >= 0xc2 && byte <= 0xdf) utf8_need = 1;
+                else if (byte >= 0xe0 && byte <= 0xef) {
+                    utf8_need = 2;
+                    utf8_min = byte == 0xe0 ? 0xa0 : 0x80;
+                    utf8_max = byte == 0xed ? 0x9f : 0xbf;
+                } else if (byte >= 0xf0 && byte <= 0xf4) {
+                    utf8_need = 3;
+                    utf8_min = byte == 0xf0 ? 0x90 : 0x80;
+                    utf8_max = byte == 0xf4 ? 0x8f : 0xbf;
+                }
+                else if (byte == 0 || byte >= 0x80) ret = -EPROTO;
+                if (!ret && !utf8_need &&
+                    (reply_boundary(sentence, length) ||
+                     length >= REPLY_SENTENCE_BYTES - 4)) flush = 1;
+            }
+        } else if (!ret && s_reply.done) {
+            if (utf8_need) ret = -EPROTO;
+            else if (length) flush = 1;
+            else done = 1;
+        } else if (!ret) {
+            reply_wait_locked(REPLY_IDLE_FLUSH_MS);
+            if (!s_reply.size && length >= 18 && !utf8_need) flush = 1;
+        }
+        pthread_mutex_unlock(&s_reply.lock);
+        if (ret || done) break;
+        if (!flush) continue;
+
+        sentence[length] = '\0';
+        tts_strip_markdown(sentence);
+        length = 0;
+        if (!sentence[0]) continue;
+        output.terminal = 0;
+        ret = tts_speak_queued(sentence, &output, 1, &id);
+        if (output.error) ret = output.error;
+        if (ret) break;
+        spoken++;
+    }
+    if (!ret && !spoken) ret = -ENODATA;
+    if (ret == -ECANCELED) atomic_store(&s_voice.tts_abort, 1);
+    ret = tts_release_output(&output, ret);
+finish:
+    pthread_mutex_lock(&s_reply.lock);
+    s_reply.error = ret;
+    s_reply.done = 1;
+    pthread_cond_broadcast(&s_reply.changed);
+    pthread_mutex_unlock(&s_reply.lock);
+    pthread_mutex_unlock(&s_voice.speak_lock);
+    return NULL;
+}
+
+static int voice_channel_reply_stream(uint64_t id, int event,
+    const char* text, size_t length)
+{
+    if (event == AGENT_REPLY_BEGIN) {
+        int ret = voice_request_status(id);
+        if (ret) return ret;
+        pthread_mutex_lock(&s_voice.lock);
+        if (s_voice.state != VOICE_PROCESSING || s_voice.reply_stream_active ||
+            s_voice.tts_active) ret = -EBUSY;
+        else {
+            s_voice.state = VOICE_SPEAKING;
+            s_voice.reply_stream_active = 1;
+        }
+        pthread_mutex_unlock(&s_voice.lock);
+        if (ret) return ret;
+        pthread_mutex_lock(&s_reply.lock);
+        if (s_reply.active) ret = -EBUSY;
+        else {
+            s_reply.id = id;
+            s_reply.head = s_reply.size = 0;
+            s_reply.done = s_reply.abort = s_reply.error = 0;
+            s_reply.active = 1;
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            ret = pthread_attr_setstacksize(&attr, 24 * 1024);
+            if (!ret) ret = pthread_create(&s_reply.worker, &attr,
+                reply_text_worker, NULL);
+            pthread_attr_destroy(&attr);
+            if (ret) { s_reply.active = 0; ret = -ret; }
+        }
+        pthread_mutex_unlock(&s_reply.lock);
+        if (ret) {
+            pthread_mutex_lock(&s_voice.lock);
+            s_voice.reply_stream_active = 0;
+            if (s_voice.state == VOICE_SPEAKING)
+                s_voice.state = VOICE_PROCESSING;
+            pthread_mutex_unlock(&s_voice.lock);
+        }
+        return ret;
+    }
+
+    pthread_mutex_lock(&s_reply.lock);
+    if (!s_reply.active || s_reply.id != id) {
+        pthread_mutex_unlock(&s_reply.lock);
+        return -ESTALE;
+    }
+    if (event == AGENT_REPLY_DELTA) {
+        if (!text && length) { pthread_mutex_unlock(&s_reply.lock); return -EINVAL; }
+        int ret = 0;
+        for (size_t off = 0; off < length && !ret;) {
+            while (s_reply.size == REPLY_TEXT_QUEUE_BYTES && !s_reply.done &&
+                   !s_reply.error && !ret) {
+                ret = voice_request_status(id);
+                if (!ret) reply_wait_locked(100);
+            }
+            if (ret) break;
+            if (s_reply.error) ret = s_reply.error;
+            else if (s_reply.done || s_reply.abort) ret = -ECANCELED;
+            else ret = voice_request_status(id);
+            if (ret) break;
+            size_t tail = (s_reply.head + s_reply.size) % REPLY_TEXT_QUEUE_BYTES;
+            size_t count = REPLY_TEXT_QUEUE_BYTES - s_reply.size;
+            if (count > REPLY_TEXT_QUEUE_BYTES - tail)
+                count = REPLY_TEXT_QUEUE_BYTES - tail;
+            if (count > length - off) count = length - off;
+            memcpy(s_reply.queue + tail, text + off, count);
+            s_reply.size += count;
+            off += count;
+            pthread_cond_broadcast(&s_reply.changed);
+        }
+        pthread_mutex_unlock(&s_reply.lock);
+        return ret;
+    }
+    if (event != AGENT_REPLY_END && event != AGENT_REPLY_ABORT) {
+        pthread_mutex_unlock(&s_reply.lock);
+        return -EINVAL;
+    }
+    s_reply.done = 1;
+    if (event == AGENT_REPLY_ABORT) s_reply.abort = 1;
+    pthread_cond_broadcast(&s_reply.changed);
+    pthread_mutex_unlock(&s_reply.lock);
+    if (event == AGENT_REPLY_ABORT) {
+        pthread_mutex_lock(&s_voice.lock);
+        atomic_store(&s_voice.tts_abort, 1);
+        if (s_voice.tts_pb) audio_playback_stop(s_voice.tts_pb);
+        pthread_mutex_unlock(&s_voice.lock);
+        voice_tts_cancel();
+    }
+    pthread_join(s_reply.worker, NULL);
+    pthread_mutex_lock(&s_reply.lock);
+    int result = s_reply.error;
+    s_reply.active = 0;
+    s_reply.head = s_reply.size = 0;
+    pthread_mutex_unlock(&s_reply.lock);
+    pthread_mutex_lock(&s_voice.lock);
+    s_voice.reply_stream_active = 0;
+    if (s_voice.request_id == id && s_voice.state == VOICE_SPEAKING)
+        s_voice.state = VOICE_PROCESSING;
+    pthread_mutex_unlock(&s_voice.lock);
+    return event == AGENT_REPLY_ABORT ? 0 : result;
+}
+
 int voice_channel_speak(const char* text)
 {
     if (!text || text[0] == '\0') {
@@ -1489,6 +2100,10 @@ int voice_channel_speak(const char* text)
      * so we don't overlap media_player sessions (which causes the
      * media framework to attempt a ~1.3GB allocation and crash). */
     pthread_mutex_lock(&s_voice.lock);
+    if (s_voice.reply_stream_active) {
+        pthread_mutex_unlock(&s_voice.lock);
+        return -EBUSY;
+    }
     if (s_voice.tts_active) {
         syslog(LOG_INFO, "[%s] speak: aborting previous TTS\n", TAG);
         s_voice.tts_abort = 1;
@@ -1503,7 +2118,8 @@ int voice_channel_speak(const char* text)
 
     /* ── AEC workaround: reject TTS while PTT is recording ── */
     pthread_mutex_lock(&s_voice.lock);
-    if (s_voice.state != VOICE_IDLE && s_voice.state != VOICE_SPEAKING) {
+    if (s_voice.reply_stream_active ||
+        (s_voice.state != VOICE_IDLE && s_voice.state != VOICE_SPEAKING)) {
         pthread_mutex_unlock(&s_voice.lock);
         pthread_mutex_unlock(&s_voice.speak_lock);
         syslog(LOG_INFO,
@@ -1579,42 +2195,10 @@ int voice_channel_speak(const char* text)
         + (tts_net.tv_nsec - s_tts_start.tv_nsec) / 1000000;
     syslog(LOG_INFO, "[%s] TTS synthesis done: %ldms\n", TAG, net_ms);
 
-    /* A backend can fail after already delivering playable PCM.  Unless this
-     * turn was actively canceled, close the data side and wait for Media's
-     * COMPLETED event before releasing the player and rearming capture. */
-    int aborted = atomic_load(&s_voice.tts_abort);
-    if (output.pb && !aborted) {
-        int drain_ret = audio_playback_drain(output.pb, 120000);
-        if (ret == 0) ret = drain_ret;
-    }
-
-    /* Stop exposing the writer handle before teardown so cancellation cannot
-     * race a freed cookie. Keep tts_active set until Media ownership is gone;
-     * request completion and trigger rearm are gated on that flag. */
-    pthread_mutex_lock(&s_voice.lock);
-    s_voice.tts_pb = NULL;
-    pthread_mutex_unlock(&s_voice.lock);
-
-    int close_ret = audio_playback_close(output.pb);
-    int closed = audio_playback_cleanup(5000);
-    if (closed == 0 && close_ret < 0) close_ret = 0;
-    if (ret == 0) ret = closed;
-
-    pthread_mutex_lock(&s_voice.lock);
-    if (closed == 0 && close_ret == 0) {
-        s_voice.tts_active = 0;
-        s_voice.tts_abort = 0;
-    } else {
-        s_voice.tts_cleanup_pending = 1;
-        s_voice.tts_cleanup_result = ret ? ret :
-            (closed ? closed : close_ret);
-    }
-    pthread_mutex_unlock(&s_voice.lock);
+    ret = tts_release_output(&output, ret);
     free(clean);
 
     if (ret != 0) {
-        if (closed != 0)
-            syslog(LOG_ERR, "[%s] playback owner retained: %d\n", TAG, closed);
         syslog(LOG_ERR, "[%s] TTS stream failed: %d\n", TAG, ret);
         pthread_mutex_unlock(&s_voice.speak_lock);
         return ret;

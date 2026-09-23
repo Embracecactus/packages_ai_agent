@@ -26,6 +26,7 @@
  * and verified I/O; Agent retains JSON, context and tool-loop ownership.
  * Registration is runtime-only and rejects changes while a call is active. */
 #include <stddef.h>
+#include "llm/llm_stream.h"
 typedef int (*llm_transport_t)(const char *request, char *response,
     size_t capacity, size_t *length, int *http_status, void *context,
     int (*check)(void *), void *request_context);
@@ -34,6 +35,20 @@ int llm_set_transport(const char *model, const char *host,
 int llm_clear_transport(void);
 int llm_cancel_request(void);
 int llm_request_busy(void);
+/* Authenticate and require HTTP 200 before the first receive callback.
+ * receive: 0=continue, 1=validated application completion (close this request
+ * and return success), negative=abort. Never retry after any emitted delta. */
+typedef int (*llm_stream_transport_t)(const char *request,
+    int (*receive)(void *, const char *, size_t), void *receive_context,
+    int *http_status, void *context,
+    int (*check)(void *), void *request_context);
+/* Uses the existing verified transport context/cancel owner. Registration is
+ * idle-only; replacing/clearing the normal transport also clears this hook. */
+/* Publish both paths and their shared lifetime atomically. */
+int llm_set_transports(const char *model, const char *host,
+    llm_transport_t transport, llm_stream_transport_t stream,
+    int (*cancel)(void *), void *context);
+int llm_final_stream_supported(void);
 
 #include "cJSON.h"
 #include "agent_compat.h"
@@ -77,6 +92,7 @@ typedef struct {
     llm_tool_call_t calls[AGENT_MAX_TOOL_CALLS];
     int call_count;
     bool tool_use;
+    bool tool_phase_complete; /* Explicit, non-truncated provider tool finish. */
 
     /* Token usage from API response */
     int prompt_tokens;
@@ -92,6 +108,18 @@ int llm_chat_tools(const char* system_prompt,
     llm_response_t* resp);
 int llm_chat_tools_checked(const char *system_prompt, cJSON *messages,
     const char *tools_json, llm_response_t *resp,
+    int (*check)(void *), void *request_context);
+/* Explicit tool-planning phase: successful responses must contain complete
+ * tool calls, never a draft text answer. Tool authorization remains in Agent. */
+int llm_chat_plan_checked(const char *system_prompt, cJSON *messages,
+    const char *tools_json, llm_response_t *resp,
+    int (*check)(void *), void *request_context);
+/* Only after Agent explicitly closes its tool phase. No tools are requested;
+ * SSE tool deltas, incomplete terminals and non-200 replies fail closed.
+ * Accumulated text is retained once for history; emit never sees reasoning.
+ */
+int llm_chat_final_stream_checked(const char *system_prompt, cJSON *messages,
+    llm_response_t *resp, llm_text_delta_t emit, void *emit_context,
     int (*check)(void *), void *request_context);
 
 /** Vision chat: send text + base64 image to a vision-capable model.

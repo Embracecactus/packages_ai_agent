@@ -34,6 +34,12 @@ static const char *TAG = "bus";
 
 int message_bus_reply(const agent_msg_t *request, char *content, int result)
 {
+    return message_bus_reply_with_history(request, content, result, NULL);
+}
+
+int message_bus_reply_with_history(const agent_msg_t *request, char *content,
+    int result, void (*history)(const agent_msg_t *, const char *))
+{
     if (!request) {
         free(content);
         return -EINVAL;
@@ -43,7 +49,22 @@ int message_bus_reply(const agent_msg_t *request, char *content, int result)
         if (status != 0) result = status;
     }
     if (!result && (!content || !content[0])) result = -ENODATA;
+    if (request->reply_stream_started && request->reply_stream) {
+        int finished = request->reply_stream(request->request_id,
+            result ? AGENT_REPLY_ABORT : AGENT_REPLY_END, NULL, 0);
+        if (!result) result = finished;
+        if (!result && request->request_commit)
+            result = request->request_commit(request->request_id);
+        if (!result && history) history(request, content);
+        free(content);
+        if (result != -EALREADY && request->request_complete)
+            request->request_complete(request->request_id, result);
+        return result;
+    }
+    if (!result && request->request_commit)
+        result = request->request_commit(request->request_id);
     if (!result) {
+        if (history) history(request, content);
         agent_msg_t reply = *request;
         reply.content = content;
         reply.image_b64 = NULL;
@@ -51,7 +72,7 @@ int message_bus_reply(const agent_msg_t *request, char *content, int result)
         if (!result) return 0;
     }
     free(content);
-    if (request->request_complete)
+    if (result != -EALREADY && request->request_complete)
         request->request_complete(request->request_id, result);
     return result;
 }

@@ -29,12 +29,25 @@ int voice_channel_init(void);
 /* Start voice recording, ASR, then push text to agent via message_bus. */
 int voice_channel_start(void);
 int voice_channel_start_auto(void);
+/* First local wake only: keep the same recorder through the acknowledgement. */
+int voice_channel_start_auto_wake(void);
 typedef void (*voice_channel_event_cb)(int event, int result);
 #define VOICE_CHANNEL_EVENT_TTS_COMPLETE 1
 #define VOICE_CHANNEL_EVENT_CAPTURE_COMPLETE 2
 #define VOICE_CHANNEL_EVENT_TURN_COMPLETE 3
 #define VOICE_CHANNEL_EVENT_INITIALIZED 4
 #define VOICE_CHANNEL_EVENT_SERVICE_READY 5
+/* Synchronous notification after the recording worker has joined and the
+ * capture lease is released, before ASR finalization. A local acknowledgement
+ * here cannot enter this turn's captured PCM. Never emitted on capture error.
+ */
+#define VOICE_CHANNEL_EVENT_CAPTURE_QUIESCENT 6
+/* Synchronous: capture's sole reader is paused and the producer discards PCM.
+ * Product must call voice_channel_wake_ack_result() before returning. */
+#define VOICE_CHANNEL_EVENT_WAKE_ACK_REQUEST 7
+#define VOICE_CHANNEL_EVENT_WAKE_ACK_SKIP 8
+#define VOICE_CHANNEL_EVENT_WAKE_ACK_CANCEL 9
+void voice_channel_wake_ack_result(int result);
 void voice_channel_service_ready(int result);
 int voice_channel_set_event_callback(voice_channel_event_cb callback);
 int voice_channel_is_idle(void);
