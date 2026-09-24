@@ -178,10 +178,16 @@ audio_playback_t* audio_playback_open(const char* dev_path,
     }
 
     char opts[PB_OPTIONS_LEN];
+    /* The 16-kHz mono PCM demuxer emits 2048-byte frames. Match the
+     * voice queue's 8192-byte prefill with four Media frames; the default
+     * six-frame resume threshold would wait for another network chunk
+     * even after the application has released a full prefill. Leave other
+     * formats on the Media default until their buffering is coordinated. */
     snprintf(opts, sizeof(opts),
-        "format=s%ule:sample_rate=%u:ch_layout=%s",
+        "format=s%ule:sample_rate=%u:ch_layout=%s%s",
         bits_per_sample, sample_rate,
-        (channels == 1) ? "mono" : "stereo");
+        (channels == 1) ? "mono" : "stereo",
+        (sample_rate == 16000 && channels == 1) ? ":datqmax=4" : "");
 
     int ret = media_player_prepare(player, NULL, opts);
     if (ret < 0) {

@@ -885,7 +885,7 @@ int llm_chat_plan_checked(const char *system_prompt, cJSON *messages,
 {
     int ret = llm_chat_tools_impl(system_prompt, messages, tools_json, resp,
         check, request_context, true);
-    if (!ret && (!resp->tool_phase_complete || !resp->call_count)) {
+    if (!ret && !resp->tool_phase_complete) {
         llm_response_free(resp);
         return -EPROTO;
     }
@@ -1022,7 +1022,8 @@ static int llm_chat_tools_impl(const char* system_prompt, cJSON* messages,
     cJSON* finish = cJSON_GetObjectItem(choice, "finish_reason");
     /* Truncated or filtered text is not a successful assistant response. */
     if ((planning && (!cJSON_IsString(finish) ||
-                      strcmp(finish->valuestring, "tool_calls"))) ||
+                      (strcmp(finish->valuestring, "tool_calls") &&
+                       strcmp(finish->valuestring, "stop")))) ||
         (cJSON_IsString(finish) &&
          (!strcmp(finish->valuestring, "length") ||
           !strcmp(finish->valuestring, "content_filter")))) {
@@ -1035,6 +1036,29 @@ static int llm_chat_tools_impl(const char* system_prompt, cJSON* messages,
     resp->tool_phase_complete = resp->tool_use;
 
     cJSON* message = cJSON_GetObjectItem(choice, "message");
+
+    if (planning && !resp->tool_use) {
+        /* A complete no-tool stop may end planning, but its draft must not
+         * be spoken or added to history. Providers with auto-only tool
+         * selection cannot be required to call our finalize pseudo-tool.
+         * Reject ambiguous tool payloads rather than silently discarding them.
+         */
+        cJSON *calls = cJSON_GetObjectItem(message, "tool_calls");
+        cJSON *legacy = cJSON_GetObjectItem(message, "function_call");
+        cJSON *content = cJSON_GetObjectItem(message, "content");
+        if (!cJSON_IsObject(message) ||
+            (calls && !cJSON_IsNull(calls) &&
+             (!cJSON_IsArray(calls) || cJSON_GetArraySize(calls))) ||
+            (legacy && !cJSON_IsNull(legacy)) ||
+            (content && !cJSON_IsNull(content) && !cJSON_IsString(content))) {
+            cJSON_Delete(root);
+            return -EPROTO;
+        }
+        resp->tool_phase_complete = true;
+        cJSON_Delete(root);
+        syslog(LOG_INFO, "[%s] planning complete=no-tools draft=discarded\n", TAG);
+        return OK;
+    }
 
     if (message) {
         cJSON* text_content = cJSON_GetObjectItem(message, "content");
@@ -1128,6 +1152,12 @@ static int llm_chat_tools_impl(const char* system_prompt, cJSON* messages,
     /* XML fallback parsers for non-standard models */
     parse_xml_tool_calls(resp);
     parse_ns_xml_tool_calls(resp);
+
+    if (planning && !resp->call_count) {
+        cJSON_Delete(root);
+        llm_response_free(resp);
+        return -EPROTO;
+    }
 
     cJSON_Delete(root);
 

@@ -31,6 +31,8 @@
 #include <errno.h>
 #include <poll.h>
 #include <pthread.h>
+#include <semaphore.h>
+#include <stdatomic.h>
 #include <media_recorder.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -49,6 +51,9 @@ static const char* TAG = "audio_cap";
 #define CAP_LOCAL_HISTORY_MS 400u
 #define CAP_PRODUCER_STACK 8192u
 #define CAP_STATS_SECONDS 8u
+#ifndef CAP_START_TIMEOUT_MS
+#define CAP_START_TIMEOUT_MS 5000u
+#endif
 #ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
 #define CAP_ALSA_NAME_DEFAULT "default"
 #endif
@@ -96,6 +101,9 @@ struct audio_capture {
     int route_active;
     int (*route)(int active);
     unsigned int sample_rate;
+    sem_t start_event;
+    atomic_int start_result;
+    int start_requested;
     pthread_mutex_t lock;
     pthread_cond_t ready;
     pthread_t producer;
@@ -122,6 +130,47 @@ static int (*s_route)(int active);
 
 static int capture_read_device(audio_capture_t *cap, void *buf, size_t len);
 static void *capture_produce(void *arg);
+
+static void capture_event(void *cookie, int event, int result,
+    const char *extra)
+{
+    audio_capture_t *cap = cookie;
+    (void)extra;
+    if (event == MEDIA_EVENT_STARTED || result < 0) {
+        int expected = -EINPROGRESS;
+        if (atomic_compare_exchange_strong(&cap->start_result,
+                &expected, result))
+            sem_post(&cap->start_event);
+    }
+}
+
+static int capture_wait_started(audio_capture_t *cap)
+{
+    struct timespec deadline;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec += CAP_START_TIMEOUT_MS / 1000u;
+    deadline.tv_nsec += (CAP_START_TIMEOUT_MS % 1000u) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    while (atomic_load(&cap->start_result) == -EINPROGRESS) {
+        if (sem_clockwait(&cap->start_event, CLOCK_MONOTONIC, &deadline) < 0 &&
+                errno != EINTR)
+            return -errno;
+    }
+    return atomic_load(&cap->start_result);
+}
+
+static int (*s_route_prepare)(unsigned int, unsigned int, unsigned int);
+
+int audio_capture_set_route_prepare(int (*prepare)(unsigned int,
+    unsigned int, unsigned int))
+{
+    if (s_active_capture) return -EBUSY;
+    s_route_prepare = prepare;
+    return 0;
+}
 
 int audio_capture_set_route(int (*route)(int active))
 {
@@ -569,6 +618,13 @@ static int open_media_recorder_capture(audio_capture_t* cap,
     }
     cap->backend = AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER;
 
+    ret = media_recorder_set_event_callback(cap->handle.recorder,
+        cap, capture_event);
+    if (ret < 0) {
+        int close_ret = close_media_recorder(cap, CAP_CLOSE_TIMEOUT_MS);
+        return close_ret < 0 ? close_ret : ret;
+    }
+
     snprintf(opts, sizeof(opts),
         "format=s%ule:sample_rate=%u:ch_layout=%s",
         bits_per_sample, sample_rate,
@@ -622,6 +678,11 @@ audio_capture_t* audio_capture_open(const char* dev_path,
     if (!cap) {
         return NULL;
     }
+    if (sem_init(&cap->start_event, 0, 0) < 0) {
+        free(cap);
+        return NULL;
+    }
+    atomic_init(&cap->start_result, -EINPROGRESS);
 
     int ret = -ENOTSUP;
 #ifdef CONFIG_AI_AGENT_AUDIO_ALSA_DIRECT
@@ -644,6 +705,7 @@ audio_capture_t* audio_capture_open(const char* dev_path,
                 cap->handle.recorder) {
                 s_active_capture = cap;
             } else {
+                sem_destroy(&cap->start_event);
                 free(cap);
             }
             errno = -ret;
@@ -736,16 +798,38 @@ int audio_capture_start(audio_capture_t* cap)
             return -EINVAL;
         }
 
+        /* The RPC acknowledges enqueue, not encoder/graph readiness. A late
+         * start event after timeout must not authorize a second start. Close
+         * the owned recorder before retrying with a fresh handle. */
+        if (cap->start_requested) return -EALREADY;
+        cap->start_requested = 1;
         cap->route = s_route;
-        if (cap->route && !cap->route_active) {
-            ret = cap->route(1);
-            if (ret < 0) return ret;
+        if (s_route_prepare && cap->route) {
+            /* A stopped source can spin on EOF as soon as a new sink asks
+             * for frames, starving the server before its STARTED event.
+             * Only the platform can establish warm format compatibility. */
             cap->route_active = 1;
+            ret = s_route_prepare(cap->sample_rate,
+                cap->requested_channels, cap->bits_per_sample);
+            if (ret < 0) return ret;
+            cap->route_active = ret > 0;
         }
         ret = media_recorder_start(cap->handle.recorder);
+        if (!ret) ret = capture_wait_started(cap);
         if (ret < 0) {
-            syslog(LOG_ERR, "[%s] start failed: %d\n", TAG, ret);
+            syslog(LOG_ERR, "[%s] start not ready: %d; route_active=%d cleanup required\n",
+                TAG, ret, cap->route_active);
             return ret;
+        }
+
+        /* STARTED guarantees the format-bearing graph link was queued.
+         * Platform routes must enqueue hardware activation behind that link,
+         * not issue an immediate start before negotiation has run. */
+        cap->route = s_route;
+        if (cap->route && !cap->route_active) {
+            cap->route_active = 1;
+            ret = cap->route(1);
+            if (ret < 0) return ret;
         }
 
         cap->started = 1;
@@ -755,7 +839,7 @@ int audio_capture_start(audio_capture_t* cap)
             if (!ret) {
                 size_t stack = CAP_PRODUCER_STACK;
 #ifdef PTHREAD_STACK_MIN
-                if (stack < PTHREAD_STACK_MIN) stack = PTHREAD_STACK_MIN;
+                if (stack < (size_t)PTHREAD_STACK_MIN) stack = PTHREAD_STACK_MIN;
 #endif
                 ret = pthread_attr_setstacksize(&attr, stack);
                 if (!ret)
@@ -1214,6 +1298,9 @@ static int capture_close(audio_capture_t* cap, unsigned int timeout_ms)
         pthread_cond_destroy(&cap->ready);
         pthread_mutex_destroy(&cap->lock);
     }
+    /* Successful recorder close joins its event dispatcher before this
+     * semaphore and callback cookie are released. */
+    sem_destroy(&cap->start_event);
     free(cap);
     syslog(LOG_INFO, "[%s] closed\n", TAG);
     return 0;
