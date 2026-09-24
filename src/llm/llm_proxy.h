@@ -92,7 +92,7 @@ typedef struct {
     llm_tool_call_t calls[AGENT_MAX_TOOL_CALLS];
     int call_count;
     bool tool_use;
-    bool tool_phase_complete; /* Explicit, non-truncated provider tool finish. */
+    bool tool_phase_complete; /* Complete tool calls or validated no-tool stop. */
 
     /* Token usage from API response */
     int prompt_tokens;
@@ -109,8 +109,9 @@ int llm_chat_tools(const char* system_prompt,
 int llm_chat_tools_checked(const char *system_prompt, cJSON *messages,
     const char *tools_json, llm_response_t *resp,
     int (*check)(void *), void *request_context);
-/* Explicit tool-planning phase: successful responses must contain complete
- * tool calls, never a draft text answer. Tool authorization remains in Agent. */
+/* Tool planning returns complete calls or a validated no-tool stop with its
+ * draft discarded. Neither path exposes a draft as a final text answer.
+ * Tool authorization and entry into final generation remain in Agent. */
 int llm_chat_plan_checked(const char *system_prompt, cJSON *messages,
     const char *tools_json, llm_response_t *resp,
     int (*check)(void *), void *request_context);

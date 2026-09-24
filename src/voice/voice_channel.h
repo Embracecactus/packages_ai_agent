@@ -47,6 +47,10 @@ typedef void (*voice_channel_event_cb)(int event, int result);
 #define VOICE_CHANNEL_EVENT_WAKE_ACK_REQUEST 7
 #define VOICE_CHANNEL_EVENT_WAKE_ACK_SKIP 8
 #define VOICE_CHANNEL_EVENT_WAKE_ACK_CANCEL 9
+/* Media accepted the first answer PCM / the output owner finished cleanup.
+ * These are playback lifecycle signals, not acoustic timestamps. */
+#define VOICE_CHANNEL_EVENT_OUTPUT_STARTED 10
+#define VOICE_CHANNEL_EVENT_OUTPUT_FINISHED 11
 void voice_channel_wake_ack_result(int result);
 void voice_channel_service_ready(int result);
 int voice_channel_set_event_callback(voice_channel_event_cb callback);

@@ -1015,6 +1015,7 @@ static void tts_stream_cb(const unsigned char* pcm_data,
                 + (now.tv_nsec - s_tts_start.tv_nsec) / 1000000;
             syslog(LOG_INFO, "[%s] TTS first Media write complete: %ldms (not acoustic)\n", TAG, ms);
             s_tts_first_chunk = 1;
+            notify_channel_event(VOICE_CHANNEL_EVENT_OUTPUT_STARTED, 0);
         }
     }
     if (is_last && out->partial_len) {
@@ -1038,12 +1039,14 @@ typedef struct {
     size_t size;
     size_t peak;
     size_t received;
+    size_t ready_received;
     int64_t last_pcm_ms;
     int64_t max_gap_ms;
     unsigned int rebuffer;
     int done;
     int terminal;
     int format_ready;
+    int segment_format_ready;
     atomic_int error;
     tts_output_t* output;
 } tts_queue_t;
@@ -1071,7 +1074,8 @@ static void* tts_queue_play(void* arg)
         pthread_mutex_lock(&q->lock);
         while (!q->done && !atomic_load(&q->error) &&
             !atomic_load(&s_voice.tts_abort) &&
-            (!q->size || (buffering && q->size < TTS_QUEUE_PREFILL)))
+            (!q->size || (buffering && q->size < TTS_QUEUE_PREFILL &&
+                         q->received - q->size >= q->ready_received)))
             tts_queue_wait(q);
         if (atomic_load(&s_voice.tts_abort))
             atomic_store(&q->error, -ECANCELED);
@@ -1115,7 +1119,7 @@ static void tts_queue_receive(const unsigned char* pcm, size_t len,
     pthread_mutex_lock(&q->lock);
     if (q->terminal || (!pcm && len))
         atomic_store(&q->error, -EPROTO);
-    if (len && !q->format_ready && !atomic_load(&q->error)) {
+    if (len && !q->segment_format_ready && !atomic_load(&q->error)) {
         /* 在接收回调内查询仍被当前请求固定的后端，不能由异步播放器
          * 在请求结束后再次查询可能已经切换的默认后端。 */
         voice_tts_capabilities_t caps = {0};
@@ -1123,16 +1127,19 @@ static void tts_queue_receive(const unsigned char* pcm, size_t len,
         if (ret || !caps.sample_rate || caps.bits != 16 ||
             (caps.channels != 1 && caps.channels != 2)) {
             atomic_store(&q->error, ret ? ret : -ENOTSUP);
-        } else if (q->output->pb &&
+        } else if (q->format_ready &&
             (q->output->format.sample_rate != caps.sample_rate ||
              q->output->format.channels != caps.channels ||
              q->output->format.bits != caps.bits)) {
             atomic_store(&q->error, -ENOTSUP);
         } else {
-            caps.batch_sample_rate = caps.sample_rate;
-            q->output->format = caps;
-            q->output->batch = 1;
+            if (!q->format_ready) {
+                caps.batch_sample_rate = caps.sample_rate;
+                q->output->format = caps;
+                q->output->batch = 1;
+            }
             q->format_ready = 1;
+            q->segment_format_ready = 1;
         }
     }
     if (len && !atomic_load(&q->error)) {
@@ -1170,15 +1177,19 @@ static void tts_queue_receive(const unsigned char* pcm, size_t len,
         len -= n;
         pthread_cond_broadcast(&q->changed);
     }
-    if (is_last) q->terminal = 1;
+    if (is_last) {
+        q->terminal = 1;
+        /* A complete short sentence must not wait for another sentence's
+         * prefill. Keep the watermark across the next request's reset. */
+        q->ready_received = q->received;
+    }
     pthread_cond_broadcast(&q->changed);
     int error = atomic_load(&q->error);
     pthread_mutex_unlock(&q->lock);
     if (error) voice_tts_cancel();
 }
 
-static int tts_speak_queued(const char* text, tts_output_t* output,
-    int tracked, uint64_t* id)
+static int tts_queue_open(tts_output_t* output, tts_queue_t** queue)
 {
     tts_queue_t* q = calloc(1, sizeof(*q));
     if (!q) return -ENOMEM;
@@ -1197,24 +1208,65 @@ static int tts_speak_queued(const char* text, tts_output_t* output,
     if (!ret) ret = pthread_create(&q->thread, &attr, tts_queue_play, q);
     pthread_attr_destroy(&attr);
     if (!ret) {
-        ret = voice_tts_speak_stream_checked(text, tts_queue_receive, q,
-            tracked ? voice_request_check : NULL, id);
-        pthread_mutex_lock(&q->lock);
-        q->done = 1;
-        pthread_cond_broadcast(&q->changed);
-        pthread_mutex_unlock(&q->lock);
-        /* 回收消费者后才允许关闭 Media，取消不能留下悬空的队列或句柄。 */
-        pthread_join(q->thread, NULL);
-        if (atomic_load(&q->error)) ret = atomic_load(&q->error);
-        syslog(LOG_INFO, "[%s] TTS queue: pcm=%zu peak=%zu rebuffer=%u max_receive_gap_ms=%ld\n",
-            TAG, q->received, q->peak, q->rebuffer, (long)q->max_gap_ms);
-    } else {
-        ret = -ret;
+        *queue = q;
+        return 0;
     }
     pthread_cond_destroy(&q->changed);
     pthread_mutex_destroy(&q->lock);
     free(q);
+    return -ret;
+}
+
+static int tts_queue_sentence(tts_queue_t* q, const char* text,
+    int tracked, uint64_t* id)
+{
+    /* A backend request ends a sentence, not the shared playback stream. */
+    pthread_mutex_lock(&q->lock);
+    q->terminal = 0;
+    q->segment_format_ready = 0;
+    int ret = atomic_load(&q->error);
+    pthread_mutex_unlock(&q->lock);
+    if (!ret) ret = voice_tts_speak_stream_checked(text, tts_queue_receive, q,
+        tracked ? voice_request_check : NULL, id);
+    pthread_mutex_lock(&q->lock);
+    if (!ret && !q->terminal) ret = -EPROTO;
+    if (!ret && q->format_ready &&
+        q->received % (q->output->format.channels * 2)) ret = -EPROTO;
+    /* Keep the playback/protocol cause if canceling the transport merely
+     * reported ECANCELED while the same request was unwinding. */
+    if (ret && !atomic_load(&q->error)) atomic_store(&q->error, ret);
+    if (atomic_load(&q->error)) ret = atomic_load(&q->error);
+    pthread_cond_broadcast(&q->changed);
+    pthread_mutex_unlock(&q->lock);
     return ret;
+}
+
+static int tts_queue_close(tts_queue_t* q, int ret)
+{
+    pthread_mutex_lock(&q->lock);
+    if (ret && !atomic_load(&q->error)) atomic_store(&q->error, ret);
+    q->done = 1;
+    pthread_cond_broadcast(&q->changed);
+    pthread_mutex_unlock(&q->lock);
+    /* Join the sole consumer before releasing Media or its stack context. */
+    pthread_join(q->thread, NULL);
+    if (atomic_load(&q->error)) ret = atomic_load(&q->error);
+    syslog(LOG_INFO, "[%s] TTS queue: pcm=%zu peak=%zu rebuffer=%u max_receive_gap_ms=%ld\n",
+        TAG, q->received, q->peak, q->rebuffer, (long)q->max_gap_ms);
+    pthread_cond_destroy(&q->changed);
+    pthread_mutex_destroy(&q->lock);
+    free(q);
+    return ret;
+}
+
+static int tts_speak_queued(const char* text, tts_output_t* output,
+    int tracked, uint64_t* id)
+{
+    tts_queue_t* q = NULL;
+    int ret = tts_queue_open(output, &q);
+    if (ret) return ret;
+    ret = tts_queue_sentence(q, text, tracked, id);
+    return tts_queue_close(q, ret);
 }
 
 /* One Media owner covers every sentence in a streamed final reply. */
@@ -1222,7 +1274,9 @@ static int tts_release_output(tts_output_t* output, int ret)
 {
     if (output->error) ret = output->error;
     if (ret == 0 && (!output->terminal || !output->pb)) ret = -EPROTO;
-    if (output->pb && !atomic_load(&s_voice.tts_abort)) {
+    /* Drain only a successful, complete stream. An incomplete network reply
+     * must stop/close instead of waiting another full drain timeout. */
+    if (ret == 0 && output->pb && !atomic_load(&s_voice.tts_abort)) {
         int drained = audio_playback_drain(output->pb, 120000);
         if (ret == 0) ret = drained;
     }
@@ -1243,6 +1297,8 @@ static int tts_release_output(tts_output_t* output, int ret)
             (cleanup ? cleanup : closed_handle);
     }
     pthread_mutex_unlock(&s_voice.lock);
+    if (cleanup == 0 && closed_handle == 0)
+        notify_channel_event(VOICE_CHANNEL_EVENT_OUTPUT_FINISHED, ret);
     return ret;
 }
 
@@ -1694,6 +1750,8 @@ int voice_channel_recover(void)
     }
     pthread_mutex_unlock(&s_voice.lock);
 
+    if (ret == 0 && kind == CLEANUP_PLAYBACK)
+        notify_channel_event(VOICE_CHANNEL_EVENT_OUTPUT_FINISHED, result);
     if (ret == 0 && current) voice_request_complete(id, result);
     return ret;
 }
@@ -1900,6 +1958,7 @@ static void* reply_text_worker(void* unused)
     (void)unused;
     char sentence[REPLY_SENTENCE_BYTES + 1];
     size_t length = 0;
+    uint64_t body_deadline_ms = 0;
     int utf8_need = 0, spoken = 0, ret = 0;
     unsigned char utf8_min = 0x80, utf8_max = 0xbf;
     uint64_t id = s_reply.id;
@@ -1917,7 +1976,10 @@ static void* reply_text_worker(void* unused)
     clock_gettime(CLOCK_MONOTONIC, &s_tts_start);
     s_tts_first_chunk = 0;
 
-    for (;;) {
+    tts_queue_t* queue = NULL;
+    ret = tts_queue_open(&output, &queue);
+
+    while (!ret) {
         int flush = 0, done = 0;
         pthread_mutex_lock(&s_reply.lock);
         if (s_reply.abort) ret = -ECANCELED;
@@ -1930,6 +1992,8 @@ static void* reply_text_worker(void* unused)
             if (length == REPLY_SENTENCE_BYTES) ret = -EOVERFLOW;
             else {
                 sentence[length++] = (char)byte;
+                if (spoken && length == 1)
+                    body_deadline_ms = voice_now_ms() + REPLY_IDLE_FLUSH_MS;
                 if (utf8_need) {
                     if (byte < utf8_min || byte > utf8_max) ret = -EPROTO;
                     else {
@@ -1949,16 +2013,29 @@ static void* reply_text_worker(void* unused)
                 }
                 else if (byte == 0 || byte >= 0x80) ret = -EPROTO;
                 if (!ret && !utf8_need &&
-                    (reply_boundary(sentence, length) ||
-                     length >= REPLY_SENTENCE_BYTES - 4)) flush = 1;
+                    /* Keep first-sentence latency; coalesce the rest so each
+                     * comma does not incur another synchronous TTS request. */
+                    ((spoken == 0 && reply_boundary(sentence, length)) ||
+                     length >= REPLY_SENTENCE_BYTES - 4 ||
+                     (body_deadline_ms &&
+                      voice_now_ms() >= body_deadline_ms))) flush = 1;
             }
         } else if (!ret && s_reply.done) {
             if (utf8_need) ret = -EPROTO;
             else if (length) flush = 1;
             else done = 1;
         } else if (!ret) {
-            reply_wait_locked(REPLY_IDLE_FLUSH_MS);
-            if (!s_reply.size && length >= 18 && !utf8_need) flush = 1;
+            if (body_deadline_ms) {
+                uint64_t now = voice_now_ms();
+                uint64_t remaining = body_deadline_ms > now ?
+                    body_deadline_ms - now : 0;
+                if (remaining <= 0 && !utf8_need) flush = 1;
+                else reply_wait_locked(remaining > 0 ?
+                    (unsigned int)remaining : REPLY_IDLE_FLUSH_MS);
+            } else {
+                reply_wait_locked(REPLY_IDLE_FLUSH_MS);
+                if (!s_reply.size && length >= 18 && !utf8_need) flush = 1;
+            }
         }
         pthread_mutex_unlock(&s_reply.lock);
         if (ret || done) break;
@@ -1967,15 +2044,15 @@ static void* reply_text_worker(void* unused)
         sentence[length] = '\0';
         tts_strip_markdown(sentence);
         length = 0;
+        body_deadline_ms = 0;
         if (!sentence[0]) continue;
-        output.terminal = 0;
-        ret = tts_speak_queued(sentence, &output, 1, &id);
-        if (output.error) ret = output.error;
+        ret = tts_queue_sentence(queue, sentence, 1, &id);
         if (ret) break;
         spoken++;
     }
     if (!ret && !spoken) ret = -ENODATA;
     if (ret == -ECANCELED) atomic_store(&s_voice.tts_abort, 1);
+    if (queue) ret = tts_queue_close(queue, ret);
     ret = tts_release_output(&output, ret);
 finish:
     pthread_mutex_lock(&s_reply.lock);

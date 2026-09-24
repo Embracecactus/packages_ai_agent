@@ -43,9 +43,18 @@ typedef struct audio_capture_stats {
 } audio_capture_stats_t;
 
 /* Optional platform route/policy mapping. Install before opening capture.
- * The capture owner enables it before start and disables it after close.
+ * The capture owner enables it after Media STARTED and disables it after close.
+ * STARTED only confirms the format-bearing graph link was queued; a Media
+ * hardware route must enqueue activation behind that link, not start inline.
  * An error prevents capture or is retained for cleanup before the next open. */
 int audio_capture_set_route(int (*route)(int active));
+
+/* Optional warm-route preparation before queuing a new recorder graph link.
+ * Return 1 only when a previously negotiated, compatible route was enabled,
+ * 0 to defer a cold route until STARTED, or a negative error. Installed with
+ * no active capture. route(0) must undo any partial preparation on failure. */
+int audio_capture_set_route_prepare(int (*prepare)(unsigned int rate,
+    unsigned int channels, unsigned int bits));
 
 /* Local wake consumer of the same recorder used by the next conversation.
  * PCM stays local until handoff and a matching audio_capture_open claims it.

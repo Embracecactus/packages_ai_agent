@@ -51,6 +51,7 @@ static const char* TAG = "agent";
 #define TOOL_OUTPUT_SIZE (8 * 1024)
 #define TOOL_OUTPUT_SIZE_LARGE (16 * 1024)
 #define TOOL_OUTPUT_SIZE_MIN (2 * 1024)
+#define FINAL_PHASE_TOOL "agent_finalize"
 
 /* ── Forward declarations ──────────────────────────────────── */
 
@@ -196,7 +197,7 @@ static void* tool_exec_thread(void* arg)
 static void add_tool_result_messages(cJSON* messages,
     const llm_response_t* resp, char* tool_output,
     size_t tool_output_size, const char* msg_channel,
-    const char* msg_chat_id, const agent_msg_t* request)
+    const char* msg_chat_id, const agent_msg_t* request, bool defer_finalize)
 {
     int n = resp->call_count;
 
@@ -254,6 +255,20 @@ static void add_tool_result_messages(cJSON* messages,
             threads[i] = 0;
             continue;
         }
+        tasks[i].output[0] = '\0';
+
+        /* A mixed batch must finish its real tools before finalization.
+         * Acknowledge the pseudo-call without executing a registry tool or
+         * leaving an unmatched tool_call_id in the conversation. */
+        if (defer_finalize &&
+            !strcmp(tasks[i].call->name, FINAL_PHASE_TOOL)) {
+            snprintf(tasks[i].output, tasks[i].output_size,
+                "{\"status\":\"deferred\",\"reason\":\"Review the other tool "
+                "results first. Call agent_finalize alone with {} only "
+                "when no further tools are needed.\"}");
+            threads[i] = 0;
+            continue;
+        }
 
         pthread_attr_t attr;
         pthread_attr_init(&attr);
@@ -263,13 +278,15 @@ static void add_tool_result_messages(cJSON* messages,
             != 0) {
             syslog(LOG_ERR, "[%s] Failed to spawn thread for tool %s\n",
                 TAG, resp->calls[i].name);
+            snprintf(tasks[i].output, tasks[i].output_size,
+                "{\"error\":\"Tool worker unavailable; action was not executed\"}");
             threads[i] = 0;
         }
         pthread_attr_destroy(&attr);
     }
 
     /* Join and collect results, dedup by tool_call_id */
-    char seen_ids[AGENT_MAX_TOOL_CALLS][32];
+    char seen_ids[AGENT_MAX_TOOL_CALLS][sizeof(resp->calls[0].id)] = {0};
     int seen_count = 0;
 
     for (int i = 0; i < n; i++) {
@@ -300,7 +317,8 @@ static void add_tool_result_messages(cJSON* messages,
             cJSON_AddStringToObject(result_msg, "content",
                 (tasks[i].output && tasks[i].output[0])
                     ? tasks[i].output
-                    : "{}");
+                    : (tasks[i].output ? "{}" :
+                       "{\"error\":\"Out of memory; action was not executed\"}"));
             cJSON_AddItemToArray(messages, result_msg);
         }
 
@@ -1018,7 +1036,6 @@ static int agent_request_check(void *context)
  * It costs a planning request; comparisons must include that request. The
  * same Agent still owns tool authorization, history and the final reply.
  */
-#define FINAL_PHASE_TOOL "agent_finalize"
 static char *voice_planning_tools(const char *tools)
 {
     cJSON *array = tools ? cJSON_Parse(tools) : cJSON_CreateArray();
@@ -1055,24 +1072,44 @@ static int final_body_delta(void *context, const char *text, size_t length)
 static char *voice_final_phase(const char *system, cJSON *messages,
     const llm_response_t *plan, agent_msg_t *msg, int *failure)
 {
-    const llm_tool_call_t *call = &plan->calls[0];
-    cJSON *args = call->input ? cJSON_ParseWithOpts(call->input, NULL, 1) : NULL;
-    if (!plan->tool_phase_complete || plan->call_count != 1 ||
-        !call->id[0] || !cJSON_IsObject(args) || args->child) {
-        cJSON_Delete(args); *failure = -EPROTO; return NULL;
+    if (!plan->tool_phase_complete) {
+        *failure = -EPROTO;
+        return NULL;
     }
-    cJSON_Delete(args);
-    add_assistant_message(messages, plan);
-    cJSON *result = cJSON_CreateObject();
-    if (!result || !cJSON_AddStringToObject(result, "role", "tool") ||
-        !cJSON_AddStringToObject(result, "tool_call_id", call->id) ||
-        !cJSON_AddStringToObject(result, "content",
-            "Tool phase completed. Give the final answer directly from the available evidence; no more tools.")) {
-        cJSON_Delete(result); *failure = -ENOMEM; return NULL;
+    /* Repeated finalize calls express one idempotent phase transition. Check
+     * the complete batch before adding results; never drop a real tool. */
+    for (int i = 0; i < plan->call_count; i++) {
+        const llm_tool_call_t *call = &plan->calls[i];
+        cJSON *args = call->input ? cJSON_ParseWithOpts(call->input, NULL, 1) : NULL;
+        if (strcmp(call->name, FINAL_PHASE_TOOL) || !call->id[0] ||
+            !cJSON_IsObject(args) || args->child) {
+            cJSON_Delete(args); *failure = -EPROTO; return NULL;
+        }
+        cJSON_Delete(args);
+        for (int j = 0; j < i; j++) {
+            if (!strcmp(call->id, plan->calls[j].id)) {
+                *failure = -EPROTO; return NULL;
+            }
+        }
     }
-    if (!cJSON_AddItemToArray(messages, result)) {
-        cJSON_Delete(result); *failure = -ENOMEM; return NULL;
+    if (plan->call_count) {
+        add_assistant_message(messages, plan);
     }
+    for (int i = 0; i < plan->call_count; i++) {
+        const llm_tool_call_t *call = &plan->calls[i];
+        cJSON *result = cJSON_CreateObject();
+        if (!result || !cJSON_AddStringToObject(result, "role", "tool") ||
+            !cJSON_AddStringToObject(result, "tool_call_id", call->id) ||
+            !cJSON_AddStringToObject(result, "content",
+                "Tool phase completed. Give the final answer directly from the available evidence; no more tools.")) {
+            cJSON_Delete(result); *failure = -ENOMEM; return NULL;
+        }
+        if (!cJSON_AddItemToArray(messages, result)) {
+            cJSON_Delete(result); *failure = -ENOMEM; return NULL;
+        }
+    }
+    /* A completed no-tool planning response carries no tool result and no
+     * draft into history. Both paths enter the same final-body stream. */
     *failure = agent_request_check(msg);
     if (!*failure) *failure = msg->reply_stream(msg->request_id, AGENT_REPLY_BEGIN, NULL, 0);
     if (*failure) return NULL;
@@ -1242,10 +1279,33 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
             "[%s] LLM resp: text=%zu, tool_use=%d, calls=%d\n",
             TAG, resp.text_len, resp.tool_use, resp.call_count);
 
+        /* 先校验整批 ID，再执行任何动作或写入工具历史；不能执行后
+         * 去重，否则真实动作的结果可能被同 ID 的 finalize 覆盖。
+         */
+        bool call_ids_valid = true;
+        for (int i = 0; i < resp.call_count; i++) {
+            if (!resp.calls[i].id[0]) call_ids_valid = false;
+            for (int j = 0; j < i; j++)
+                if (!strcmp(resp.calls[i].id, resp.calls[j].id))
+                    call_ids_valid = false;
+        }
+        if (!call_ids_valid) {
+            llm_response_free(&resp);
+            *failure = -EPROTO;
+            break;
+        }
+
         int final_requested = 0;
         for (int i = 0; i < resp.call_count; i++)
-            if (!strcmp(resp.calls[i].name, FINAL_PHASE_TOOL)) final_requested = 1;
-        if (planning_tools && final_requested) {
+            if (!strcmp(resp.calls[i].name, FINAL_PHASE_TOOL)) final_requested++;
+        bool defer_finalize = planning_tools && final_requested &&
+            final_requested < resp.call_count;
+        if (defer_finalize)
+            syslog(LOG_INFO, "[%s] finalize deferred real_tools=%d markers=%d\n",
+                TAG, resp.call_count - final_requested, final_requested);
+        if (planning_tools && ((final_requested &&
+                                final_requested == resp.call_count) ||
+            (resp.tool_phase_complete && !resp.tool_use && !resp.call_count))) {
             syslog(LOG_INFO, "[%s] final phase planning_requests=%d\n", TAG, iteration + 1);
             agent_trace_step(&trace, iteration, FINAL_PHASE_TOOL, latency_ms, 1);
             gettimeofday(&tv_start, NULL);
@@ -1371,14 +1431,14 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         if (should_break) {
             add_assistant_message(messages, &resp);
             add_tool_result_messages(messages, &resp, tool_output,
-                tool_size, msg->channel, msg->chat_id, msg);
+                tool_size, msg->channel, msg->chat_id, msg, defer_finalize);
             llm_response_free(&resp);
             break;
         }
 
         add_assistant_message(messages, &resp);
         add_tool_result_messages(messages, &resp, tool_output,
-            tool_size, msg->channel, msg->chat_id, msg);
+            tool_size, msg->channel, msg->chat_id, msg, defer_finalize);
 
         /* Local tool shortcut: if the single tool in this round is a
          * local file op, skip the next LLM round and use the tool

@@ -62,10 +62,16 @@ static int dispatch(struct llm_final_stream *p)
     cJSON *delta = cJSON_GetObjectItemCaseSensitive(choice, "delta");
     cJSON *finish = cJSON_GetObjectItemCaseSensitive(choice, "finish_reason");
     if (!cJSON_IsNumber(index) || index->valuedouble != 0 || !cJSON_IsObject(delta)) goto out;
-    if (cJSON_GetObjectItemCaseSensitive(delta, "tool_calls") ||
-        cJSON_GetObjectItemCaseSensitive(delta, "function_call")) goto out;
+    /* OpenAI-compatible providers may send explicit null placeholders.
+     * They are not tool decisions; non-null tool payloads remain forbidden
+     * in this already-confirmed final-body phase. */
+    cJSON *tools = cJSON_GetObjectItemCaseSensitive(delta, "tool_calls");
+    cJSON *function = cJSON_GetObjectItemCaseSensitive(delta, "function_call");
+    if ((tools && !cJSON_IsNull(tools)) ||
+        (function && !cJSON_IsNull(function))) goto out;
     cJSON *role = cJSON_GetObjectItemCaseSensitive(delta, "role");
-    if (role && (!cJSON_IsString(role) || strcmp(role->valuestring, "assistant"))) goto out;
+    if (role && !cJSON_IsNull(role) &&
+        (!cJSON_IsString(role) || strcmp(role->valuestring, "assistant"))) goto out;
     if (finish && !cJSON_IsNull(finish) &&
         (!cJSON_IsString(finish) || strcmp(finish->valuestring, "stop"))) goto out;
     cJSON *content = cJSON_GetObjectItemCaseSensitive(delta, "content");
