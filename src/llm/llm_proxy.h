@@ -109,9 +109,9 @@ int llm_chat_tools(const char* system_prompt,
 int llm_chat_tools_checked(const char *system_prompt, cJSON *messages,
     const char *tools_json, llm_response_t *resp,
     int (*check)(void *), void *request_context);
-/* Tool planning returns complete calls or a validated no-tool stop with its
- * draft discarded. Neither path exposes a draft as a final text answer.
- * Tool authorization and entry into final generation remain in Agent. */
+/* Tool planning returns complete calls or a validated no-tool stop retaining
+ * its complete body, without reasoning text. Agent authorizes final delivery;
+ * empty bodies and explicit finalize calls still require final generation. */
 int llm_chat_plan_checked(const char *system_prompt, cJSON *messages,
     const char *tools_json, llm_response_t *resp,
     int (*check)(void *), void *request_context);
