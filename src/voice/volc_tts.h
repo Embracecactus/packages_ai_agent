@@ -49,6 +49,12 @@ int volc_tts_ws_synthesize_stream(const char *text,
                                   volc_tts_chunk_cb cb,
                                   void *user_data);
 
+/* Reset and interrupt the single active WebSocket request.  Cancellation
+ * wakes transport I/O only; the synthesize caller remains the TLS owner and
+ * performs all cleanup before it returns. */
+int volc_tts_ws_prepare_request(void);
+int volc_tts_ws_cancel(void);
+
 #ifdef __cplusplus
 }
 #endif
