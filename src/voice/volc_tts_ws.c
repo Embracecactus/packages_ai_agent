@@ -635,14 +635,8 @@ static int recv_tts_audio(tts_tls_ctx_t* ctx, volc_tts_chunk_cb cb,
                 break;
             }
 
-            /* Peer close after audio started is normal EOF. */
-            if (chunks > 0 && ret == -ECONNRESET) {
-                syslog(LOG_INFO, "[%s] recv ended after %d chunks (rc=%d)\n",
-                    TAG, chunks, ret);
-                break;
-            }
-
-            syslog(LOG_ERR, "[%s] recv error before any audio: %d\n", TAG, ret);
+            syslog(LOG_ERR, "[%s] recv error after %d audio chunks: %d\n",
+                TAG, chunks, ret);
             err = ret;
             break;
         }
