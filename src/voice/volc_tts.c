@@ -447,9 +447,11 @@ static int volc_tts_capabilities(voice_tts_capabilities_t* caps)
 static const voice_tts_ops_t s_volc_tts_ops = {
     .name = "volcengine",
     .init = volc_tts_init,
+    .prepare_request = volc_tts_ws_prepare_request,
     .synthesize = volc_tts_synthesize,
     .synthesize_stream = volc_tts_ws_synthesize_stream,
     .get_capabilities = volc_tts_capabilities,
+    .cancel = volc_tts_ws_cancel,
     .deinit = NULL,
 };
 

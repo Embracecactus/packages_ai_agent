@@ -41,6 +41,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -86,7 +87,106 @@ typedef struct {
     mbedtls_ssl_config cfg;
     mbedtls_net_context net;
     mbedtls_ctr_drbg_context ctr_drbg;
+    unsigned long request_generation;
 } tts_tls_ctx_t;
+
+typedef struct {
+    pthread_mutex_t lock;
+    unsigned long generation;
+    bool prepared;
+    bool active;
+    bool canceled;
+    int fd;
+} tts_request_state_t;
+
+static tts_request_state_t s_request = {
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+    .fd = -1,
+};
+
+static int request_begin(unsigned long* generation)
+{
+    if (!generation) {
+        return -EINVAL;
+    }
+
+    pthread_mutex_lock(&s_request.lock);
+    if (s_request.active) {
+        pthread_mutex_unlock(&s_request.lock);
+        return -EBUSY;
+    }
+
+    /* Direct callers do not pass through prepare_request.  Registry callers
+     * do, so preserve any cancellation that arrived after prepare and before
+     * the synthesize function acquired its transport context. */
+    if (!s_request.prepared) {
+        s_request.canceled = false;
+    }
+    s_request.prepared = false;
+    s_request.generation++;
+    if (s_request.generation == 0) {
+        s_request.generation++;
+    }
+    *generation = s_request.generation;
+    s_request.active = true;
+    s_request.fd = -1;
+    bool canceled = s_request.canceled;
+    if (canceled) {
+        s_request.active = false;
+    }
+    pthread_mutex_unlock(&s_request.lock);
+    return canceled ? -ECANCELED : 0;
+}
+
+static bool request_canceled(unsigned long generation)
+{
+    if (generation == 0) {
+        return false;
+    }
+
+    pthread_mutex_lock(&s_request.lock);
+    bool canceled = s_request.active
+        && s_request.generation == generation
+        && s_request.canceled;
+    pthread_mutex_unlock(&s_request.lock);
+    return canceled;
+}
+
+static int request_publish_fd(unsigned long generation, int fd)
+{
+    pthread_mutex_lock(&s_request.lock);
+    if (!s_request.active || s_request.generation != generation) {
+        pthread_mutex_unlock(&s_request.lock);
+        return -ESTALE;
+    }
+
+    s_request.fd = fd;
+    bool canceled = s_request.canceled;
+    if (canceled && fd >= 0) {
+        (void)shutdown(fd, SHUT_RDWR);
+    }
+    pthread_mutex_unlock(&s_request.lock);
+    return canceled ? -ECANCELED : 0;
+}
+
+static void request_unpublish_fd(unsigned long generation)
+{
+    pthread_mutex_lock(&s_request.lock);
+    if (s_request.active && s_request.generation == generation) {
+        s_request.fd = -1;
+    }
+    pthread_mutex_unlock(&s_request.lock);
+}
+
+static void request_finish(unsigned long generation)
+{
+    pthread_mutex_lock(&s_request.lock);
+    if (s_request.active && s_request.generation == generation) {
+        s_request.fd = -1;
+        s_request.active = false;
+    }
+    pthread_mutex_unlock(&s_request.lock);
+}
 
 /* ── Entropy ─────────────────────────────────────────────────── */
 
@@ -601,11 +701,21 @@ static int recv_tts_audio(tts_tls_ctx_t* ctx, volc_tts_chunk_cb cb,
     uint64_t last_pcm_ms = 0;
 
     while (1) {
+        if (request_canceled(ctx->request_generation)) {
+            err = -ECANCELED;
+            break;
+        }
+
         size_t flen;
         int opcode;
         ret = ws_recv_frame(ctx, buf, WS_BUF_SIZE, &flen, &opcode);
 
         if (ret != 0) {
+            if (request_canceled(ctx->request_generation)) {
+                err = -ECANCELED;
+                break;
+            }
+
             /* Timeout after audio started: retry up to N times to
              * tolerate transient stalls.  Only declare EOF after
              * consecutive timeouts exceed the threshold (~1.5s). */
@@ -688,6 +798,10 @@ static int recv_tts_audio(tts_tls_ctx_t* ctx, volc_tts_chunk_cb cb,
                         unsigned char* pcm = buf + audio_off;
                         size_t pcm_len = flen - audio_off;
 
+                        if (request_canceled(ctx->request_generation)) {
+                            err = -ECANCELED;
+                            break;
+                        }
                         cb(pcm, pcm_len, 0, user_data);
                         chunks++;
                         ret = monotonic_milliseconds(&last_pcm_ms);
@@ -747,8 +861,11 @@ static int recv_tts_audio(tts_tls_ctx_t* ctx, volc_tts_chunk_cb cb,
 
     free(buf);
 
-    if (chunks > 0 && err == 0) {
+    if (chunks > 0 && err == 0
+        && !request_canceled(ctx->request_generation)) {
         cb(NULL, 0, 1, user_data);
+    } else if (err == 0 && request_canceled(ctx->request_generation)) {
+        err = -ECANCELED;
     }
 
     syslog(LOG_INFO, "[%s] %d audio chunks delivered\n", TAG, chunks);
@@ -789,6 +906,31 @@ static void tts_ws_init(void)
 
 /* ── Public API ──────────────────────────────────────────────── */
 
+int volc_tts_ws_prepare_request(void)
+{
+    pthread_mutex_lock(&s_request.lock);
+    int ret = s_request.active ? -EBUSY : 0;
+    if (ret == 0) {
+        s_request.prepared = true;
+        s_request.canceled = false;
+    }
+    pthread_mutex_unlock(&s_request.lock);
+    return ret;
+}
+
+int volc_tts_ws_cancel(void)
+{
+    pthread_mutex_lock(&s_request.lock);
+    s_request.canceled = true;
+    int ret = 0;
+    if (s_request.active && s_request.fd >= 0
+        && shutdown(s_request.fd, SHUT_RDWR) < 0) {
+        ret = errno ? -errno : -EIO;
+    }
+    pthread_mutex_unlock(&s_request.lock);
+    return ret;
+}
+
 int volc_tts_ws_synthesize_stream(const char* text, volc_tts_chunk_cb cb,
     void* user_data)
 {
@@ -803,28 +945,48 @@ int volc_tts_ws_synthesize_stream(const char* text, volc_tts_chunk_cb cb,
         return -ENOENT;
     }
 
+    unsigned long generation;
+    int ret = request_begin(&generation);
+    if (ret != 0) {
+        return ret;
+    }
+
     tts_tls_ctx_t ctx;
-    int ret = tts_tls_connect(&ctx, AGENT_DOUBAO_TTS_HOST, AGENT_DOUBAO_TTS_PORT);
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.net.fd = -1;
+    ctx.request_generation = generation;
+    ret = tts_tls_connect(&ctx, AGENT_DOUBAO_TTS_HOST, AGENT_DOUBAO_TTS_PORT);
 
     if (ret != 0) {
-        tts_tls_free(&ctx);
+        if (request_canceled(generation)) {
+            ret = -ECANCELED;
+        }
+        request_finish(generation);
         return ret;
     }
 
-    ret = ws_upgrade(&ctx, AGENT_DOUBAO_TTS_HOST, TTS_WS_PATH, s_token);
-    if (ret != 0) {
-        tts_tls_free(&ctx);
-        return ret;
+    ret = request_publish_fd(generation, ctx.net.fd);
+    if (ret == 0) {
+        ret = ws_upgrade(&ctx, AGENT_DOUBAO_TTS_HOST, TTS_WS_PATH, s_token);
+    }
+    if (ret == 0 && request_canceled(generation)) {
+        ret = -ECANCELED;
+    }
+    if (ret == 0) {
+        ret = send_tts_request(&ctx, text);
+    }
+    if (ret == 0 && request_canceled(generation)) {
+        ret = -ECANCELED;
+    }
+    if (ret == 0) {
+        ret = recv_tts_audio(&ctx, cb, user_data);
     }
 
-    ret = send_tts_request(&ctx, text);
-    if (ret != 0) {
-        tts_tls_free(&ctx);
-        return ret;
+    if (ret != 0 && request_canceled(generation)) {
+        ret = -ECANCELED;
     }
-
-    ret = recv_tts_audio(&ctx, cb, user_data);
-
+    request_unpublish_fd(generation);
     tts_tls_free(&ctx);
+    request_finish(generation);
     return ret;
 }
