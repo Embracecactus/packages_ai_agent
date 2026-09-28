@@ -1038,10 +1038,9 @@ static int llm_chat_tools_impl(const char* system_prompt, cJSON* messages,
     cJSON* message = cJSON_GetObjectItem(choice, "message");
 
     if (planning && !resp->tool_use) {
-        /* A complete no-tool stop may end planning, but its draft must not
-         * be spoken or added to history. Providers with auto-only tool
-         * selection cannot be required to call our finalize pseudo-tool.
-         * Reject ambiguous tool payloads rather than silently discarding them.
+        /* A complete no-tool stop can already contain the final body.
+         * Retain only that validated content, never reasoning or ambiguous
+         * tool payloads. Agent still owns final admission and delivery.
          */
         cJSON *calls = cJSON_GetObjectItem(message, "tool_calls");
         cJSON *legacy = cJSON_GetObjectItem(message, "function_call");
@@ -1054,9 +1053,18 @@ static int llm_chat_tools_impl(const char* system_prompt, cJSON* messages,
             cJSON_Delete(root);
             return -EPROTO;
         }
+        if (cJSON_IsString(content) && content->valuestring[0]) {
+            resp->text = strdup(content->valuestring);
+            if (!resp->text) {
+                cJSON_Delete(root);
+                return -ENOMEM;
+            }
+            resp->text_len = strlen(resp->text);
+        }
         resp->tool_phase_complete = true;
         cJSON_Delete(root);
-        syslog(LOG_INFO, "[%s] planning complete=no-tools draft=discarded\n", TAG);
+        syslog(LOG_INFO, "[%s] planning complete=no-tools body_bytes=%zu\n",
+            TAG, resp->text_len);
         return OK;
     }
 

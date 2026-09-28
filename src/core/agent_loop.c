@@ -1108,12 +1108,21 @@ static char *voice_final_phase(const char *system, cJSON *messages,
             cJSON_Delete(result); *failure = -ENOMEM; return NULL;
         }
     }
-    /* A completed no-tool planning response carries no tool result and no
-     * draft into history. Both paths enter the same final-body stream. */
+    /* Both paths use the same final-body consumer and outer history commit.
+     * A validated complete no-tool body needs no second model request.
+     * Empty bodies and explicit finalize calls still use the final stream.
+     */
     *failure = agent_request_check(msg);
     if (!*failure) *failure = msg->reply_stream(msg->request_id, AGENT_REPLY_BEGIN, NULL, 0);
     if (*failure) return NULL;
     msg->reply_stream_started = 1;
+    if (!plan->tool_use && !plan->call_count && plan->text && plan->text_len) {
+        char *text = strdup(plan->text);
+        if (!text) { *failure = -ENOMEM; return NULL; }
+        *failure = final_body_delta(msg, text, strlen(text));
+        if (*failure) { free(text); return NULL; }
+        return text;
+    }
     llm_response_t response;
     *failure = llm_chat_final_stream_checked(system, messages, &response,
         final_body_delta, msg, agent_request_check, msg);
