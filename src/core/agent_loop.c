@@ -718,8 +718,9 @@ static char* handle_vision_message(agent_msg_t* msg)
     const char* prompt = (msg->content && msg->content[0])
         ? msg->content
         : AGENT_VISION_DEFAULT_PROMPT;
-    int err = llm_chat_vision(
-        prompt, msg->image_b64, NULL, vision_resp, vis_size);
+    int err = llm_chat_vision_checked(
+        prompt, msg->image_b64, NULL, vision_resp, vis_size,
+        agent_request_check, msg);
 
     free(msg->image_b64);
     msg->image_b64 = NULL;
@@ -1194,8 +1195,13 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
 
     for (iteration = 0; iteration < AGENT_AI_AGENT_MAX_TOOL_ITER;
          iteration++) {
-        if (msg->request_status && msg->request_status(msg->request_id) != 0)
-            break;
+        if (msg->request_status) {
+            int request_status = msg->request_status(msg->request_id);
+            if (request_status != 0) {
+                *failure = request_status;
+                break;
+            }
+        }
         send_working_status(msg, iteration);
 
         llm_response_t resp;

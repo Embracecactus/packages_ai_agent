@@ -53,6 +53,8 @@ void resp_buf_free(resp_buf_t* rb);
 
 int llm_http_call(const char* post_data, resp_buf_t* rb,
     int* out_status);
+int llm_http_call_checked(const char* post_data, resp_buf_t* rb,
+    int* out_status, int (*check)(void *), void *request_context);
 
 /* ── Config snapshot helpers ──────────────────────────────── */
 

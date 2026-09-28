@@ -129,6 +129,9 @@ int llm_chat_final_stream_checked(const char *system_prompt, cJSON *messages,
 int llm_chat_vision(const char* prompt, const char* image_b64,
     const char* mime_type,
     char* response_buf, size_t buf_size);
+int llm_chat_vision_checked(const char* prompt, const char* image_b64,
+    const char* mime_type, char* response_buf, size_t buf_size,
+    int (*check)(void *), void *request_context);
 
 /** Memory-optimized vision chat: accepts raw image bytes instead of
  *  pre-encoded base64.  Performs base64 encoding and JSON construction

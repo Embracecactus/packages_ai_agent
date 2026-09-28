@@ -628,15 +628,12 @@ static int llm_http_via_proxy(const char* post_data, resp_buf_t* rb,
     return OK;
 }
 
-static int llm_http_call_checked(const char* post_data, resp_buf_t* rb,
-    int* out_status, int (*check)(void *), void *request_context);
-
 int llm_http_call(const char* post_data, resp_buf_t* rb, int* out_status)
 {
     return llm_http_call_checked(post_data, rb, out_status, NULL, NULL);
 }
 
-static int llm_http_call_checked(const char* post_data, resp_buf_t* rb,
+int llm_http_call_checked(const char* post_data, resp_buf_t* rb,
     int* out_status, int (*check)(void *), void *request_context)
 {
     int status = check ? check(request_context) : 0;
@@ -650,6 +647,7 @@ static int llm_http_call_checked(const char* post_data, resp_buf_t* rb,
         int ret = resp_buf_init(rb, AGENT_LLM_STREAM_BUF_SIZE);
         if (ret == 0) ret = transport(post_data, rb->data, rb->cap,
             &rb->len, out_status, context, check, request_context);
+        if (ret == 0 && check) ret = check(request_context);
         if (ret != 0) resp_buf_free(rb);
         pthread_mutex_lock(&s_llm_lock);
         s_transport_users--;
@@ -671,6 +669,8 @@ static int llm_http_call_checked(const char* post_data, resp_buf_t* rb,
     int ret = ERROR;
 
     for (int attempt = 0; attempt <= retry_max; attempt++) {
+        ret = check ? check(request_context) : 0;
+        if (ret) return ret;
         if (attempt > 0) {
             /* Check network state before retrying */
             if (network_get_state() != NET_STATE_CONNECTED) {
@@ -679,7 +679,11 @@ static int llm_http_call_checked(const char* post_data, resp_buf_t* rb,
             }
             int delay = retry_base * (1 << (attempt - 1));
             syslog(LOG_INFO, "[llm] Retry %d/%d after %ds\n", attempt, retry_max, delay);
-            sleep(delay);
+            while (delay-- > 0) {
+                ret = check ? check(request_context) : 0;
+                if (ret) return ret;
+                sleep(1);
+            }
         }
 
         if (use_tls && http_proxy_is_enabled()) {
@@ -689,7 +693,8 @@ static int llm_http_call_checked(const char* post_data, resp_buf_t* rb,
         }
 
         if (ret == OK) {
-            return OK;
+            ret = check ? check(request_context) : 0;
+            return ret;
         }
 
         syslog(LOG_WARNING, "[llm] HTTP call failed (attempt %d/%d)\n",
@@ -711,9 +716,12 @@ static int llm_http_call_checked(const char* post_data, resp_buf_t* rb,
     }
     return ERROR;
 #else
-    if (use_tls && http_proxy_is_enabled())
-        return llm_http_via_proxy(post_data, rb, out_status);
-    return llm_http_direct(post_data, rb, out_status);
+    int ret = use_tls && http_proxy_is_enabled() ?
+        llm_http_via_proxy(post_data, rb, out_status) :
+        llm_http_direct(post_data, rb, out_status);
+    if (!ret && check) ret = check(request_context);
+    if (ret && rb->data) resp_buf_free(rb);
+    return ret;
 #endif
 }
 
