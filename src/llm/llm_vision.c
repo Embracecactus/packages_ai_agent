@@ -42,6 +42,14 @@ int llm_chat_vision(const char* prompt, const char* image_b64,
     const char* mime_type, char* response_buf,
     size_t buf_size)
 {
+    return llm_chat_vision_checked(prompt, image_b64, mime_type,
+        response_buf, buf_size, NULL, NULL);
+}
+
+int llm_chat_vision_checked(const char* prompt, const char* image_b64,
+    const char* mime_type, char* response_buf, size_t buf_size,
+    int (*check)(void *), void *request_context)
+{
     char model[64], api_key[128], llm_host[128];
     llm_snapshot_vision_config(model, sizeof(model),
         api_key, sizeof(api_key),
@@ -132,7 +140,8 @@ int llm_chat_vision(const char* prompt, const char* image_b64,
 
     resp_buf_t rb = { 0 };
     int status = 0;
-    int err = llm_http_call(post_data, &rb, &status);
+    int err = llm_http_call_checked(post_data, &rb, &status,
+        check, request_context);
     free(post_data);
 
     if (err != OK) {
