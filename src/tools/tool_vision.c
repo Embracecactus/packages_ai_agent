@@ -61,8 +61,26 @@ static int auto_capture(const char* path)
 #endif
 }
 
-int tool_analyze_image_execute(const char* input_json, char* output, size_t output_size)
+static int vision_request_status(char* output, size_t output_size,
+    int (*check)(void*), void* request_context)
 {
+    int status = check ? check(request_context) : 0;
+    if (status != 0 && output && output_size) {
+        output[0] = '\0';
+    }
+    return status;
+}
+
+int tool_analyze_image_execute_checked(const char* input_json,
+    char* output, size_t output_size, int (*check)(void*),
+    void* request_context)
+{
+    int status = vision_request_status(output, output_size,
+        check, request_context);
+    if (status != 0) {
+        return status;
+    }
+
     const char* image_path = AGENT_CAPTURE_PATH;
     const char* prompt = NULL;
     bool need_capture = true;
@@ -87,6 +105,12 @@ int tool_analyze_image_execute(const char* input_json, char* output, size_t outp
                 "{\"error\":\"fbcapture failed, is display active?\"}");
             cJSON_Delete(root);
             return ERROR;
+        }
+        status = vision_request_status(output, output_size,
+            check, request_context);
+        if (status != 0) {
+            cJSON_Delete(root);
+            return status;
         }
     }
 
@@ -131,6 +155,14 @@ int tool_analyze_image_execute(const char* input_json, char* output, size_t outp
         snprintf(output, output_size, "{\"error\":\"Short read on image\"}");
         cJSON_Delete(root);
         return ERROR;
+    }
+
+    status = vision_request_status(output, output_size,
+        check, request_context);
+    if (status != 0) {
+        free(raw);
+        cJSON_Delete(root);
+        return status;
     }
 
     /* Detect image format from magic bytes */
@@ -179,11 +211,18 @@ int tool_analyze_image_execute(const char* input_json, char* output, size_t outp
         return ERROR;
     }
 
-    int ret = llm_chat_vision_raw(prompt, raw, nread, mime_type,
-        resp_buf, output_size);
+    int ret = llm_chat_vision_raw_checked(prompt, raw, nread, mime_type,
+        resp_buf, output_size, check, request_context);
     free(raw);
     free(b64);
     cJSON_Delete(root);
+
+    status = vision_request_status(output, output_size,
+        check, request_context);
+    if (status != 0) {
+        free(resp_buf);
+        return status;
+    }
 
     if (ret != OK) {
         snprintf(output, output_size, "{\"error\":\"%s\"}", resp_buf);
@@ -207,4 +246,11 @@ int tool_analyze_image_execute(const char* input_json, char* output, size_t outp
     }
 
     return OK;
+}
+
+int tool_analyze_image_execute(const char* input_json,
+    char* output, size_t output_size)
+{
+    return tool_analyze_image_execute_checked(input_json, output, output_size,
+        NULL, NULL);
 }

@@ -292,7 +292,7 @@ int tool_registry_init(void)
         tool_fetch_url_execute);
 
     /* Vision tool */
-    REGISTER_TOOL(
+    REGISTER_TOOL_CHECKED(
         "analyze_image",
         "Analyze a screen screenshot or image file with vision LLM. "
         "Without image_path: auto-captures screen. With image_path: reads file.",
@@ -300,7 +300,8 @@ int tool_registry_init(void)
             TOOL_PARAM_STR("image_path", "Optional: path to an existing image "
                                          "file. Omit to auto-capture screen.") "," TOOL_PARAM_STR("prompt", "Question or instruction about the image")
                 TOOL_SCHEMA_END(),
-        tool_analyze_image_execute);
+        tool_analyze_image_execute,
+        tool_analyze_image_execute_checked);
 
     /* Camera capture tool */
 #ifdef CONFIG_AI_AGENT_CAMERA
@@ -613,7 +614,19 @@ int tool_registry_execute_checked(const char *name, const char *input_json,
     for (int i = 0; i < s_tool_count; i++) {
         if (strcmp(s_tools[i].name, name) == 0) {
             syslog(LOG_INFO, "[%s] Executing tool: %s\n", TAG, name);
-            int ret = s_tools[i].execute(input_json, output, output_size);
+            int ret = s_tools[i].execute_checked
+                ? s_tools[i].execute_checked(input_json, output, output_size,
+                    check, request_context)
+                : s_tools[i].execute(input_json, output, output_size);
+            if (ret == OK && s_tools[i].execute_checked && check) {
+                status = check(request_context);
+                if (status != 0) {
+                    if (output && output_size) {
+                        output[0] = '\0';
+                    }
+                    return status;
+                }
+            }
             if (ret == OK) {
                 tool_guard_record_call(name);
             }

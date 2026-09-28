@@ -30,11 +30,16 @@
 extern "C" {
 #endif
 
+typedef int (*tool_execute_checked_fn)(const char* input_json,
+    char* output, size_t output_size, int (*check)(void*),
+    void* request_context);
+
 typedef struct {
     const char* name;
     const char* description;
     const char* input_schema_json;
     int (*execute)(const char* input_json, char* output, size_t output_size);
+    tool_execute_checked_fn execute_checked;
 } agent_tool_t;
 
 /* ── Schema builder macros (compile-time JSON Schema generation) ─── */
@@ -76,6 +81,18 @@ typedef struct {
 
 #define REGISTER_TOOL_NO_PARAMS(tname, desc, fn) \
     REGISTER_TOOL(tname, desc, TOOL_NO_PARAMS, fn)
+
+#define REGISTER_TOOL_CHECKED(tname, desc, schema, fn, checked_fn) \
+    do {                                                         \
+        agent_tool_t _tool_##fn = {                              \
+            .name = tname,                                       \
+            .description = desc,                                 \
+            .input_schema_json = schema,                         \
+            .execute = fn,                                       \
+            .execute_checked = checked_fn,                       \
+        };                                                       \
+        register_tool(&_tool_##fn);                              \
+    } while (0)
 
 /* ── External tool provider callback (breaks circular dependency) ──── */
 
