@@ -241,6 +241,12 @@ int audio_playback_write(audio_playback_t* pb, const void* buf, size_t len)
         return -EINVAL;
     }
 
+    /* Stop owns the terminal result even when Media has already retired
+     * its data socket. Do not turn confirmed cancellation into EBADF. */
+    if (atomic_load(&pb->stopped)) {
+        return -ECANCELED;
+    }
+
     /* Buffer-mode Media explicitly exposes its data socket for callers that
      * need normal stream semantics.  Use it here because a nonblocking stream
      * write may complete partially; media_player_write_data() treats that as
