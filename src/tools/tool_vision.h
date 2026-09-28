@@ -21,3 +21,6 @@
 
 /** analyze_image tool: read JPEG, base64 encode, call vision LLM */
 int tool_analyze_image_execute(const char *input_json, char *output, size_t output_size);
+int tool_analyze_image_execute_checked(const char* input_json,
+    char* output, size_t output_size, int (*check)(void*),
+    void* request_context);

@@ -223,6 +223,23 @@ int llm_chat_vision_raw(const char* prompt,
     const char* mime_type,
     char* response_buf, size_t buf_size)
 {
+    return llm_chat_vision_raw_checked(prompt, raw_image, raw_len, mime_type,
+        response_buf, buf_size, NULL, NULL);
+}
+
+int llm_chat_vision_raw_checked(const char* prompt,
+    const unsigned char* raw_image, size_t raw_len,
+    const char* mime_type, char* response_buf, size_t buf_size,
+    int (*check)(void *), void* request_context)
+{
+    int request_status = check ? check(request_context) : 0;
+    if (request_status != 0) {
+        if (response_buf && buf_size) {
+            response_buf[0] = '\0';
+        }
+        return request_status;
+    }
+
     char model[64], api_key[128], llm_host[128];
     llm_snapshot_vision_config(model, sizeof(model),
         api_key, sizeof(api_key),
@@ -299,11 +316,19 @@ int llm_chat_vision_raw(const char* prompt,
 
     resp_buf_t rb = { 0 };
     int status = 0;
-    int err = llm_http_call(body, &rb, &status);
+    int err = llm_http_call_checked(body, &rb, &status,
+        check, request_context);
     free(body);
 
     if (err != OK) {
         resp_buf_free(&rb);
+        request_status = check ? check(request_context) : 0;
+        if (request_status != 0) {
+            if (response_buf && buf_size) {
+                response_buf[0] = '\0';
+            }
+            return request_status;
+        }
         snprintf(response_buf, buf_size, "Error: Vision HTTP request failed");
         return err;
     }
@@ -336,5 +361,12 @@ int llm_chat_vision_raw(const char* prompt,
         syslog(LOG_DEBUG, "[%s] Vision response: %d bytes\n", TAG,
             (int)strlen(response_buf));
 
+    request_status = check ? check(request_context) : 0;
+    if (request_status != 0) {
+        if (response_buf && buf_size) {
+            response_buf[0] = '\0';
+        }
+        return request_status;
+    }
     return OK;
 }

@@ -141,6 +141,10 @@ int llm_chat_vision_raw(const char* prompt,
     const unsigned char* raw_image, size_t raw_len,
     const char* mime_type,
     char* response_buf, size_t buf_size);
+int llm_chat_vision_raw_checked(const char* prompt,
+    const unsigned char* raw_image, size_t raw_len,
+    const char* mime_type, char* response_buf, size_t buf_size,
+    int (*check)(void *), void *request_context);
 
 /** Vision config snapshot: returns the vision-specific model/api_key/host.
  *  If vision model is not configured, falls back to the main LLM config. */
