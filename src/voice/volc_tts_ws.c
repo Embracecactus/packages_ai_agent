@@ -69,6 +69,12 @@ static const char* TAG = "volc_tts_ws";
 #define WS_FIN_BIT 0x80
 #define WS_MASK_BIT 0x80
 
+#define TTS_RECV_TIMEOUT_MS 500u
+#define TTS_MAX_CONSECUTIVE_TIMEOUTS 3u
+#define TTS_PCM_PROGRESS_TIMEOUT_MS \
+    (TTS_RECV_TIMEOUT_MS * TTS_MAX_CONSECUTIVE_TIMEOUTS)
+#define TTS_FIRST_PCM_TIMEOUT_MS 10000u
+
 /* Credentials */
 static char s_appid[64];
 static char s_token[128];
@@ -528,13 +534,54 @@ static int send_tts_request(tts_tls_ctx_t* ctx, const char* text)
 
 /* ── Receive audio responses ─────────────────────────────────── */
 
+static int monotonic_milliseconds(uint64_t* value)
+{
+    struct timespec now;
+
+    if (!value || clock_gettime(CLOCK_MONOTONIC, &now) < 0) {
+        return -EIO;
+    }
+
+    *value = (uint64_t)now.tv_sec * 1000u
+        + (uint64_t)now.tv_nsec / 1000000u;
+    return 0;
+}
+
+static int progress_expired(uint64_t last_progress_ms, uint64_t timeout_ms,
+    bool* expired)
+{
+    uint64_t now_ms;
+    int ret;
+
+    if (!expired) {
+        return -EINVAL;
+    }
+
+    ret = monotonic_milliseconds(&now_ms);
+    if (ret != 0) {
+        return ret;
+    }
+
+    *expired = now_ms < last_progress_ms
+        || now_ms - last_progress_ms >= timeout_ms;
+    return 0;
+}
+
 static int recv_tts_audio(tts_tls_ctx_t* ctx, volc_tts_chunk_cb cb,
     void* user_data)
 {
     unsigned char* buf = malloc(WS_BUF_SIZE);
+    uint64_t receive_started_ms;
+    int ret;
 
     if (!buf) {
         return -ENOMEM;
+    }
+
+    ret = monotonic_milliseconds(&receive_started_ms);
+    if (ret != 0) {
+        free(buf);
+        return ret;
     }
 
     /* Recv timeout strategy:
@@ -542,39 +589,49 @@ static int recv_tts_audio(tts_tls_ctx_t* ctx, volc_tts_chunk_cb cb,
      *   latency varies with text length and server load (200ms–2s typical).
      * - After first chunk: tighten to 500ms per recv.  To tolerate
      *   transient network stalls without silently truncating audio,
-     *   allow up to 3 consecutive timeouts (~1.5s total) before
-     *   declaring end-of-stream.  A single stall just retries.
+     *   allow up to 3 consecutive timeouts (~1.5s total) before reporting
+     *   a stalled stream.  A single stall just retries.
      * The initial 10s timeout was set by tts_tls_connect(), so we only
-     * need to tighten it after the first audio chunk arrives. */
-
-#define TTS_MAX_CONSECUTIVE_TIMEOUTS 3
+     * need to tighten it after the first audio chunk arrives.  Successful
+     * non-PCM frames do not extend either progress deadline. */
 
     int chunks = 0;
-    int consecutive_timeouts = 0;
+    unsigned int consecutive_timeouts = 0;
     int err = 0;
+    uint64_t last_pcm_ms = 0;
 
     while (1) {
         size_t flen;
         int opcode;
-        int ret = ws_recv_frame(ctx, buf, WS_BUF_SIZE, &flen, &opcode);
+        ret = ws_recv_frame(ctx, buf, WS_BUF_SIZE, &flen, &opcode);
 
         if (ret != 0) {
             /* Timeout after audio started: retry up to N times to
              * tolerate transient stalls.  Only declare EOF after
              * consecutive timeouts exceed the threshold (~1.5s). */
             if (chunks > 0 && ret == -ETIMEDOUT) {
+                bool expired;
+
                 consecutive_timeouts++;
-                if (consecutive_timeouts < TTS_MAX_CONSECUTIVE_TIMEOUTS) {
+                ret = progress_expired(last_pcm_ms,
+                    TTS_PCM_PROGRESS_TIMEOUT_MS, &expired);
+                if (ret != 0) {
+                    err = ret;
+                    break;
+                }
+                if (!expired
+                    && consecutive_timeouts < TTS_MAX_CONSECUTIVE_TIMEOUTS) {
                     syslog(LOG_DEBUG,
-                        "[%s] recv timeout %d/%d, retrying\n",
+                        "[%s] recv timeout %u/%u, retrying\n",
                         TAG, consecutive_timeouts,
                         TTS_MAX_CONSECUTIVE_TIMEOUTS);
                     continue;
                 }
-                syslog(LOG_INFO,
-                    "[%s] recv ended after %d chunks "
-                    "(%d consecutive timeouts)\n",
+                syslog(LOG_WARNING,
+                    "[%s] PCM progress timed out after %d chunks "
+                    "(%u receive timeouts)\n",
                     TAG, chunks, consecutive_timeouts);
+                err = -ETIMEDOUT;
                 break;
             }
 
@@ -590,91 +647,105 @@ static int recv_tts_audio(tts_tls_ctx_t* ctx, volc_tts_chunk_cb cb,
             break;
         }
 
-        /* Any successful frame resets the timeout counter. */
-        consecutive_timeouts = 0;
-
         if (opcode == WS_OPCODE_CLOSE) {
             syslog(LOG_INFO, "[%s] server closed WS\n", TAG);
             break;
         }
 
-        if (flen < 4) {
-            continue;
-        }
+        if (flen >= 4) {
+            unsigned char msg_type = buf[1] & 0xF0;
+            unsigned char msg_flags = buf[1] & 0x0F;
+            size_t volc_hdr_len = (size_t)(buf[0] & 0x0F) * 4;
 
-        unsigned char msg_type = buf[1] & 0xF0;
-        unsigned char msg_flags = buf[1] & 0x0F;
-        size_t volc_hdr_len = (size_t)(buf[0] & 0x0F) * 4;
+            if (volc_hdr_len >= 4 && flen >= volc_hdr_len) {
+                /* Error response */
+                if (msg_type == VOLC_MSG_ERROR) {
+                    uint32_t code = 0;
 
+                    if (flen >= volc_hdr_len + 4) {
+                        code = ((uint32_t)buf[volc_hdr_len] << 24)
+                            | ((uint32_t)buf[volc_hdr_len + 1] << 16)
+                            | ((uint32_t)buf[volc_hdr_len + 2] << 8)
+                            | (uint32_t)buf[volc_hdr_len + 3];
+                    }
 
-        if (volc_hdr_len < 4 || flen < volc_hdr_len) {
-            continue;
-        }
+                    syslog(LOG_ERR, "[%s] server error: %lu\n", TAG,
+                        (unsigned long)code);
+                    err = -EIO;
+                    break;
+                }
 
-        /* Error response */
-        if (msg_type == VOLC_MSG_ERROR) {
-            uint32_t code = 0;
+                /* Frontend response (e.g. duration info) — signals end of
+                 * audio when it arrives after audio chunks were received. */
+                if (msg_type == VOLC_MSG_FRONTEND && chunks > 0) {
+                    break;
+                }
 
-            if (flen >= volc_hdr_len + 4) {
-                code = ((uint32_t)buf[volc_hdr_len] << 24) | ((uint32_t)buf[volc_hdr_len + 1] << 16) | ((uint32_t)buf[volc_hdr_len + 2] << 8) | (uint32_t)buf[volc_hdr_len + 3];
-            }
+                /* Audio-only response (0xB), flags 1+ carry audio data. */
+                if (msg_type == VOLC_MSG_AUDIO_RESP && msg_flags != 0) {
+                    size_t audio_off = volc_hdr_len + 8;
 
-            syslog(LOG_ERR, "[%s] server error: %lu\n", TAG, (unsigned long)code);
-            err = -EIO;
-            break;
-        }
+                    if (flen > audio_off) {
+                        int32_t seq = (int32_t)(
+                            ((uint32_t)buf[volc_hdr_len] << 24)
+                            | ((uint32_t)buf[volc_hdr_len + 1] << 16)
+                            | ((uint32_t)buf[volc_hdr_len + 2] << 8)
+                            | (uint32_t)buf[volc_hdr_len + 3]);
+                        unsigned char* pcm = buf + audio_off;
+                        size_t pcm_len = flen - audio_off;
 
-        /* Frontend response (e.g. duration info) — signals end of audio
-         * when it arrives after audio chunks have been received. */
-        if (msg_type == VOLC_MSG_FRONTEND) {
-            if (chunks > 0) {
-                break; /* All audio delivered, frontend is the epilogue */
-            }
-            continue;
-        }
+                        cb(pcm, pcm_len, 0, user_data);
+                        chunks++;
+                        ret = monotonic_milliseconds(&last_pcm_ms);
+                        if (ret != 0) {
+                            err = ret;
+                            break;
+                        }
+                        consecutive_timeouts = 0;
 
-        /* Audio-only response (0xB) */
-        if (msg_type == VOLC_MSG_AUDIO_RESP) {
-            /* flags: 0=ack(no audio), 1+=has audio data */
-            if (msg_flags == 0) {
-                continue; /* ACK, no audio data */
-            }
+                        /* After first chunk, tighten recv timeout so we
+                         * detect a stalled stream promptly. */
+                        if (chunks == 1 && ctx->net.fd >= 0) {
+                            struct timeval tv = {
+                                .tv_sec = 0,
+                                .tv_usec = TTS_RECV_TIMEOUT_MS * 1000u,
+                            };
+                            if (setsockopt(ctx->net.fd, SOL_SOCKET,
+                                    SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+                                syslog(LOG_WARNING,
+                                    "[%s] setsockopt SO_RCVTIMEO failed: %d\n",
+                                    TAG, errno);
+                            }
+                        }
 
-            /* After volc header: 4-byte sequence (signed) + 4-byte payload_size */
-            size_t audio_off = volc_hdr_len + 8;
-
-            if (flen <= audio_off) {
-                continue;
-            }
-
-            /* Extract sequence as signed 32-bit (big-endian).
-             * Per Volcengine binary protocol: sequence < 0 means last frame. */
-            int32_t seq = (int32_t)(
-                ((uint32_t)buf[volc_hdr_len] << 24) |
-                ((uint32_t)buf[volc_hdr_len + 1] << 16) |
-                ((uint32_t)buf[volc_hdr_len + 2] << 8) |
-                (uint32_t)buf[volc_hdr_len + 3]);
-
-            unsigned char* pcm = buf + audio_off;
-            size_t pcm_len = flen - audio_off;
-
-            cb(pcm, pcm_len, 0, user_data);
-            chunks++;
-
-            /* After first chunk, tighten recv timeout so we detect
-             * end-of-stream quickly (server may not send close frame). */
-            if (chunks == 1 && ctx->net.fd >= 0) {
-                struct timeval tv = { .tv_sec = 0, .tv_usec = 500000 };
-                if (setsockopt(ctx->net.fd, SOL_SOCKET, SO_RCVTIMEO,
-                        &tv, sizeof(tv)) < 0) {
-                    syslog(LOG_WARNING,
-                        "[%s] setsockopt SO_RCVTIMEO failed: %d\n",
-                        TAG, errno);
+                        if (seq < 0) {
+                            break;
+                        }
+                        continue;
+                    }
                 }
             }
+        }
 
-            /* sequence < 0 = last audio frame */
-            if (seq < 0) {
+        /* Ping, ACK, empty and malformed frames are not PCM progress.  They
+         * may keep the socket active, but cannot keep this request alive. */
+        {
+            bool expired;
+            uint64_t origin_ms = chunks > 0
+                ? last_pcm_ms : receive_started_ms;
+            uint64_t timeout_ms = chunks > 0
+                ? TTS_PCM_PROGRESS_TIMEOUT_MS : TTS_FIRST_PCM_TIMEOUT_MS;
+
+            ret = progress_expired(origin_ms, timeout_ms, &expired);
+            if (ret != 0) {
+                err = ret;
+                break;
+            }
+            if (expired) {
+                syslog(LOG_WARNING,
+                    "[%s] PCM progress timed out after %d chunks\n",
+                    TAG, chunks);
+                err = -ETIMEDOUT;
                 break;
             }
         }
