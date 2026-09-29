@@ -652,6 +652,15 @@ int tool_registry_execute_checked(const char *name, const char *input_json,
             s_providers[p].execute_checked(name, input_json, output, output_size,
                 check, request_context) :
             s_providers[p].execute(name, input_json, output, output_size);
+        if (ret == OK && s_providers[p].execute_checked && check) {
+            status = check(request_context);
+            if (status != 0) {
+                if (output && output_size) {
+                    output[0] = '\0';
+                }
+                return status;
+            }
+        }
         if (ret == OK) {
             syslog(LOG_INFO, "[%s] Executed %s tool: %s\n",
                    TAG, s_providers[p].name, name);
