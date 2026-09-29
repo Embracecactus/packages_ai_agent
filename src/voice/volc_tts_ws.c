@@ -752,7 +752,14 @@ static int recv_tts_audio(tts_tls_ctx_t* ctx, volc_tts_chunk_cb cb,
         }
 
         if (opcode == WS_OPCODE_CLOSE) {
-            syslog(LOG_INFO, "[%s] server closed WS\n", TAG);
+            /* A transport close is not the Volc protocol's audio terminal.
+             * A successful stream exits above only after the negative audio
+             * sequence or a frontend terminal response.  Treat an earlier
+             * WebSocket Close as truncation so downstream playback cannot
+             * drain partial PCM as a completed answer. */
+            syslog(LOG_WARNING,
+                "[%s] server closed WS before audio terminal\n", TAG);
+            err = -ECONNRESET;
             break;
         }
 
