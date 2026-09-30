@@ -1558,6 +1558,9 @@ static int voice_channel_start_internal(int automatic)
         pthread_mutex_lock(&s_voice.lock);
         s_voice.state = VOICE_STOPPING;
         audio_capture_t* cap = s_voice.cap;
+        /* No recording worker exists. Close owns capture exclusively;
+         * cancel must not borrow it while close releases the object. */
+        s_voice.cap = NULL;
         voice_asr_stream_t* stream = s_voice.asr_stream;
         unsigned char* pcm = s_voice.pcm_buf;
         size_t pcm_len = s_voice.pcm_len;
@@ -1601,6 +1604,9 @@ static int voice_channel_start_internal(int automatic)
         pthread_join(s_voice.rec_thread, NULL);
         pthread_mutex_lock(&s_voice.lock);
         audio_capture_t* cap = s_voice.cap;
+        /* The recording worker has joined. Keep capture private to close
+         * and, on failure, the audio_capture_cleanup owner. */
+        s_voice.cap = NULL;
         voice_asr_stream_t* stream = s_voice.asr_stream;
         unsigned char* pcm = s_voice.pcm_buf;
         size_t pcm_len = s_voice.pcm_len;
@@ -1832,6 +1838,10 @@ int voice_channel_stop_with_text(char* text_out, size_t text_cap)
     audio_capture_abort(cap);
     pthread_join(s_voice.rec_thread, NULL);
     pthread_mutex_lock(&s_voice.lock);
+    /* The recording worker has joined. Detach before close can free cap,
+     * so cancellation during close or ASR cannot borrow a released object.
+     * A failed close retains it in audio_capture's cleanup owner instead. */
+    s_voice.cap = NULL;
     unsigned char *pcm = s_voice.pcm_buf;
     size_t pcm_len = s_voice.pcm_len;
     voice_asr_stream_t *stream = s_voice.asr_stream;
