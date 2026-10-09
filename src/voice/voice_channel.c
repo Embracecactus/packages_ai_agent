@@ -1834,8 +1834,10 @@ int voice_channel_stop_with_text(char* text_out, size_t text_cap)
     }
     s_voice.state = VOICE_STOPPING;
     audio_capture_t *cap = s_voice.cap;
-    pthread_mutex_unlock(&s_voice.lock);
+    /* Cancellation borrows cap under this same owner lock. Serialize abort
+     * until its producer join completes; two concurrent joins are undefined. */
     audio_capture_abort(cap);
+    pthread_mutex_unlock(&s_voice.lock);
     pthread_join(s_voice.rec_thread, NULL);
     pthread_mutex_lock(&s_voice.lock);
     /* The recording worker has joined. Detach before close can free cap,
