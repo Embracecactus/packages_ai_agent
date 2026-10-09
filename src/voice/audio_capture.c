@@ -103,6 +103,10 @@ struct audio_capture {
     unsigned int sample_rate;
     sem_t start_event;
     atomic_int start_result;
+    /* Non-ring Media has one bounded poll/read owner. Stop must not clear
+     * Media's socket between that poll and its data read. */
+    pthread_mutex_t io_lock;
+    atomic_bool abort_requested;
     int start_requested;
     pthread_mutex_t lock;
     pthread_cond_t ready;
@@ -678,7 +682,15 @@ audio_capture_t* audio_capture_open(const char* dev_path,
     if (!cap) {
         return NULL;
     }
+    int initialized = pthread_mutex_init(&cap->io_lock, NULL);
+    if (initialized) {
+        free(cap);
+        errno = initialized;
+        return NULL;
+    }
+    atomic_init(&cap->abort_requested, false);
     if (sem_init(&cap->start_event, 0, 0) < 0) {
+        pthread_mutex_destroy(&cap->io_lock);
         free(cap);
         return NULL;
     }
@@ -706,6 +718,7 @@ audio_capture_t* audio_capture_open(const char* dev_path,
                 s_active_capture = cap;
             } else {
                 sem_destroy(&cap->start_event);
+                pthread_mutex_destroy(&cap->io_lock);
                 free(cap);
             }
             errno = -ret;
@@ -1119,9 +1132,22 @@ static int capture_read_ring(audio_capture_t *cap, void *buf, size_t len,
 int audio_capture_read(audio_capture_t *cap, void *buf, size_t len)
 {
     if (cap && cap->ring) return capture_read_ring(cap, buf, len, NULL, 0);
-    int ret = capture_read_device(cap, buf, len);
-    if (cap && ret < 0 && ret != -EAGAIN && ret != -EINTR)
-        cap->stream_error = ret;
+    int ret;
+    if (cap && cap->backend == AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER) {
+        pthread_mutex_lock(&cap->io_lock);
+        ret = atomic_load(&cap->abort_requested) ? -ECANCELED :
+            capture_read_device(cap, buf, len);
+        /* A real read error remains an error; abort never closes the socket
+         * until this bounded read has relinquished it. */
+        if (ret < 0 && ret != -EAGAIN && ret != -EINTR &&
+            !(ret == -ECANCELED && atomic_load(&cap->abort_requested)))
+            cap->stream_error = ret;
+        pthread_mutex_unlock(&cap->io_lock);
+    } else {
+        ret = capture_read_device(cap, buf, len);
+        if (cap && ret < 0 && ret != -EAGAIN && ret != -EINTR)
+            cap->stream_error = ret;
+    }
     return ret;
 }
 
@@ -1233,10 +1259,17 @@ int audio_capture_abort(audio_capture_t* cap)
 
     case AUDIO_CAPTURE_BACKEND_MEDIA_RECORDER:
         if (cap->handle.recorder) {
+            /* Ring mode has already joined its sole producer above. In
+             * direct mode, prevent a new read and await the bounded existing
+             * poll/read before invoking Media's socket-closing controls. */
+            atomic_store(&cap->abort_requested, true);
+            if (!cap->ring) pthread_mutex_lock(&cap->io_lock);
 #ifdef CONFIG_MEDIA_GRAPH
             media_recorder_close_socket(cap->handle.recorder);
 #endif
-            return media_recorder_stop(cap->handle.recorder);
+            int ret = media_recorder_stop(cap->handle.recorder);
+            if (!cap->ring) pthread_mutex_unlock(&cap->io_lock);
+            return ret;
         }
         return 0;
 
@@ -1301,6 +1334,7 @@ static int capture_close(audio_capture_t* cap, unsigned int timeout_ms)
     /* Successful recorder close joins its event dispatcher before this
      * semaphore and callback cookie are released. */
     sem_destroy(&cap->start_event);
+    pthread_mutex_destroy(&cap->io_lock);
     free(cap);
     syslog(LOG_INFO, "[%s] closed\n", TAG);
     return 0;
