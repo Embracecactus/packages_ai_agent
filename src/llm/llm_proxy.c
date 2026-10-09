@@ -89,7 +89,8 @@ int llm_set_transports(const char *model, const char *host,
     llm_transport_t transport, llm_stream_transport_t stream,
     int (*cancel)(void *), void *context)
 {
-    if (!model || !host || !transport || strlen(model) >= sizeof(s_model) ||
+    if (!model || !host || (!transport && (stream || cancel || context)) ||
+        strlen(model) >= sizeof(s_model) ||
         strlen(host) >= sizeof(s_llm_host)) return -EINVAL;
     pthread_mutex_lock(&s_llm_lock);
     if (s_transport_users) { pthread_mutex_unlock(&s_llm_lock); return -EBUSY; }

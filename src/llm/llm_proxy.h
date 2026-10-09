@@ -44,7 +44,9 @@ typedef int (*llm_stream_transport_t)(const char *request,
     int (*check)(void *), void *request_context);
 /* Uses the existing verified transport context/cancel owner. Registration is
  * idle-only; replacing/clearing the normal transport also clears this hook. */
-/* Publish both paths and their shared lifetime atomically. */
+/* Publish both paths and their shared lifetime atomically. Passing all hooks
+ * and context as NULL restores public model/host only, with an empty cached
+ * key. This never writes configuration or restores authentication. */
 int llm_set_transports(const char *model, const char *host,
     llm_transport_t transport, llm_stream_transport_t stream,
     int (*cancel)(void *), void *context);
