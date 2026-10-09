@@ -753,13 +753,21 @@ static void* recording_thread(void* arg)
         }
 
         if (n <= 0) {
-            syslog(LOG_WARNING,
-                "[%s] capture read returned %d, stopping\n", TAG, n);
             pthread_mutex_lock(&s_voice.lock);
-            if (!s_voice.capture_error)
+            /* An intentional stop interrupts a blocked recorder read. Its
+             * EOF/pipe/cancel result is not a failure of the captured audio.
+             * Preserve earlier faults and every unrelated device error. */
+            int stopped = s_voice.state == VOICE_STOPPING &&
+                (n == 0 || n == -EPIPE || n == -ECANCELED);
+            if (s_voice.canceled)
+                s_voice.capture_error = -ECANCELED;
+            else if (!stopped && !s_voice.capture_error)
                 s_voice.capture_error = n < 0 ? n : -EPIPE;
+            abnormal_exit = s_voice.capture_error != 0;
             pthread_mutex_unlock(&s_voice.lock);
-            abnormal_exit = 1;
+            if (abnormal_exit)
+                syslog(LOG_WARNING,
+                    "[%s] capture read returned %d, stopping\n", TAG, n);
             break;
         }
 
