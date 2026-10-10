@@ -1169,7 +1169,9 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         planning_tools = voice_planning_tools(tools_json);
         const char suffix[] = "\nFor this voice turn, first use any necessary tools. "
             "This request chooses tools only; do not generate the answer body here. "
-            "If no tools are needed, call agent_finalize alone with {} immediately. "
+            "When no tools are needed, return only the JSON object "
+            "{\"voice_phase\":\"final\"} immediately, with no other fields or body. "
+            "This JSON is a routing decision, never the spoken answer. "
             "For a tool-backed answer, wait for the required tool results, then "
             "call agent_finalize alone with {} for the final answer stream. "
             "Never call it before required tools finish. "
