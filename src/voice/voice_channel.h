@@ -55,6 +55,8 @@ void voice_channel_wake_ack_result(int result);
 void voice_channel_service_ready(int result);
 int voice_channel_set_event_callback(voice_channel_event_cb callback);
 int voice_channel_is_idle(void);
+/* Last allocated turn identity for lifecycle logging, including after idle. */
+uint64_t voice_channel_request_id(void);
 int voice_channel_cancel(void);
 
 /* Retry teardown retained after a terminal Media close failure. The product

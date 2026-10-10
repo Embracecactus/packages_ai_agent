@@ -173,6 +173,7 @@ typedef struct {
     char channel[16];
     char chat_id[64];
     const agent_msg_t* request;
+    uint64_t ordinal;
 } tool_task_t;
 
 static void* tool_exec_thread(void* arg)
@@ -182,9 +183,11 @@ static void* tool_exec_thread(void* arg)
     t->output[0] = '\0';
     char* patched = inject_cron_context(
         t->call->name, t->call->input, t->channel, t->chat_id);
-    agent_tool_exec_streamed_checked(t->call->name,
+    agent_trace_stage(t->request->request_id, "tool_start", t->ordinal, 0);
+    int result = agent_tool_exec_streamed_checked(t->call->name,
         patched ? patched : t->call->input,
         t->output, t->output_size, agent_request_check, (void*)t->request);
+    agent_trace_stage(t->request->request_id, "tool_result", t->ordinal, result);
     free(patched);
     syslog(LOG_INFO, "[%s] Tool %s result: %d bytes\n",
         TAG, t->call->name, (int)strlen(t->output));
@@ -209,9 +212,11 @@ static void add_tool_result_messages(cJSON* messages,
         tool_output[0] = '\0';
         char* patched = inject_cron_context(
             call->name, call->input, msg_channel, msg_chat_id);
-        agent_tool_exec_streamed_checked(call->name,
+        agent_trace_stage(request->request_id, "tool_start", 1, 0);
+        int result = agent_tool_exec_streamed_checked(call->name,
             patched ? patched : call->input,
             tool_output, tool_output_size, agent_request_check, (void*)request);
+        agent_trace_stage(request->request_id, "tool_result", 1, result);
         free(patched);
         syslog(LOG_INFO, "[%s] Tool %s result: %d bytes\n", TAG,
             call->name, (int)strlen(tool_output));
@@ -233,6 +238,7 @@ static void add_tool_result_messages(cJSON* messages,
     for (int i = 0; i < n; i++) {
         tasks[i].call = &resp->calls[i];
         tasks[i].request = request;
+        tasks[i].ordinal = (uint64_t)i + 1;
         strncpy(tasks[i].channel, msg_channel ? msg_channel : "",
             sizeof(tasks[i].channel) - 1);
         strncpy(tasks[i].chat_id, msg_chat_id ? msg_chat_id : "",
@@ -1033,9 +1039,9 @@ static int agent_request_check(void *context)
     return msg->request_status ? msg->request_status(msg->request_id) : 0;
 }
 
-/* Explicit phase transition, not a guess based on an absent tool delta.
- * It costs a planning request; comparisons must include that request. The
- * same Agent still owns tool authorization, history and the final reply.
+/* Explicit final-stream transition, not a guess based on an absent tool
+ * delta. A complete validated no-tool answer can finish in the first request;
+ * tool-backed final streaming still uses the same authorization and history.
  */
 static char *voice_planning_tools(const char *tools)
 {
@@ -1050,7 +1056,8 @@ static char *voice_planning_tools(const char *tools)
     }
     cJSON *final = cJSON_Parse("{\"name\":\"agent_finalize\","
         "\"description\":\"Finish tool planning only when you have sufficient information. "
-        "Call this alone with no arguments, instead of drafting an answer. "
+        "Use this alone with no arguments to request a separate final answer stream. "
+        "It is optional when no tools are needed and a complete answer is available. "
         "The next phase will deliver the final spoken answer.\","
         "\"input_schema\":{\"type\":\"object\",\"properties\":{},"
         "\"additionalProperties\":false}}");
@@ -1125,8 +1132,10 @@ static char *voice_final_phase(const char *system, cJSON *messages,
         return text;
     }
     llm_response_t response;
+    agent_trace_stage(msg->request_id, "final_request", 1, 0);
     *failure = llm_chat_final_stream_checked(system, messages, &response,
         final_body_delta, msg, agent_request_check, msg);
+    agent_trace_stage(msg->request_id, "final_response", 1, *failure);
     char *text = response.text;
     response.text = NULL;
     llm_response_free(&response);
@@ -1151,14 +1160,22 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     prev_name[0] = '\0';
     name_repeat = 0;
     bool watchdog_fired = false;
+    uint64_t plan_sequence = 0;
+    uint64_t retry_sequence = 0;
     const char *final_system = sys_prompt;
     char *planning_tools = NULL;
     char *planning_system = NULL;
     if (msg->reply_stream && llm_final_stream_supported()) {
         planning_tools = voice_planning_tools(tools_json);
         const char suffix[] = "\nFor this voice turn, first use any necessary tools. "
-            "When ready, call agent_finalize alone with {} instead of writing the answer. "
-            "Never call it before required tools finish. Your final answer follows in a separate phase.";
+            "If no tools are needed and you can answer completely, "
+            "return the complete final answer directly. "
+            "For a tool-backed answer, wait for the required tool results, then "
+            "call agent_finalize alone with {} for the final answer stream. "
+            "Never call it before required tools finish. "
+            "Do not use a direct answer to replace required real-time data, "
+            "visual evidence, or an action's confirmed result. "
+            "Do not include reasoning, drafts, or tool arguments in the final answer.";
         planning_system = malloc(strlen(sys_prompt) + sizeof(suffix));
         if (planning_tools && planning_system) {
             strcpy(planning_system, sys_prompt);
@@ -1207,9 +1224,11 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
         llm_response_t resp;
         struct timeval tv_start, tv_end;
         gettimeofday(&tv_start, NULL);
+        agent_trace_stage(msg->request_id, "plan_request", ++plan_sequence, 0);
         int err = (planning_tools ? llm_chat_plan_checked : llm_chat_tools_checked)(
             sys_prompt, messages, tools_json, &resp,
             agent_request_check, (void *)msg);
+        agent_trace_stage(msg->request_id, "plan_response", plan_sequence, err);
         gettimeofday(&tv_end, NULL);
         uint32_t latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
 
@@ -1232,9 +1251,12 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                 trace.backend_idx = next_idx;
                 llm_response_free(&resp);
                 gettimeofday(&tv_start, NULL);
+                agent_trace_stage(msg->request_id, "plan_retry", ++retry_sequence, err);
+                agent_trace_stage(msg->request_id, "plan_request", ++plan_sequence, 0);
                 err = (planning_tools ? llm_chat_plan_checked : llm_chat_tools_checked)(
                     sys_prompt, messages,
                     tools_json, &resp, agent_request_check, (void *)msg);
+                agent_trace_stage(msg->request_id, "plan_response", plan_sequence, err);
                 gettimeofday(&tv_end, NULL);
                 latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
             }
@@ -1381,8 +1403,11 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
                     trace.backend_idx = prem_idx;
 
                     gettimeofday(&tv_start, NULL);
+                    agent_trace_stage(msg->request_id, "plan_retry", ++retry_sequence, 0);
+                    agent_trace_stage(msg->request_id, "plan_request", ++plan_sequence, 0);
                     err = llm_chat_tools_checked(sys_prompt, messages,
                         tools_json, &resp, agent_request_check, (void *)msg);
+                    agent_trace_stage(msg->request_id, "plan_response", plan_sequence, err);
                     gettimeofday(&tv_end, NULL);
                     latency_ms = calc_elapsed_ms(&tv_start, &tv_end);
 
