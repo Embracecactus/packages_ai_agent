@@ -31,6 +31,9 @@
  */
 
 #include <stdint.h>
+#include <inttypes.h>
+#include <syslog.h>
+#include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -53,6 +56,24 @@ typedef struct {
     int total_tool_calls; /* cumulative tool call count */
     int status; /* AGENT_TRACE_* */
 } agent_trace_t;
+
+/* A bounded, stateless timing ledger shared by Agent and voice ownership.
+ * Stages deliberately carry only a request ID, monotonic timestamp, numeric
+ * ordinal and result; no prompt, tool arguments, audio or credentials. */
+static inline void agent_trace_stage(uint64_t request_id, const char *stage,
+    uint64_t value, int result)
+{
+    struct timespec now = {0};
+    uint64_t monotonic_ms = 0;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+        monotonic_ms = (uint64_t)now.tv_sec * 1000u +
+            (uint64_t)now.tv_nsec / 1000000u;
+    }
+    syslog(LOG_INFO, "[voice-stage] request=%" PRIu64
+        " mono_ms=%" PRIu64 " stage=%s value=%" PRIu64 " result=%d\n",
+        request_id, monotonic_ms, stage ? stage : "unknown", value, result);
+}
 
 /**
  * Begin a new trace. Generates a unique run_id and logs the start.
