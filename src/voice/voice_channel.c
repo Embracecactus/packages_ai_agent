@@ -905,6 +905,17 @@ static void* recording_thread(void* arg)
                 break;
             }
         }
+        if (endpoint) {
+            /* Sample-clock quiet tail is a detector observation, not an
+             * acoustic timestamp of the user's actual last spoken sample. */
+#ifdef CONFIG_AI_AGENT_ADAPTIVE_ENDPOINT
+            unsigned int quiet_ms = detector.quiet_samples * 1000u /
+                AGENT_VOICE_SAMPLE_RATE;
+#else
+            unsigned int quiet_ms = silence_ms;
+#endif
+            agent_trace_stage(request_id, "endpoint_detected", quiet_ms, 0);
+        }
         int process_ret = process_audio_chunk(&stream, chunk, (size_t)n,
             &need_fallback, &total_bytes_sent);
         if (process_ret < 0) {
@@ -1917,6 +1928,7 @@ int voice_channel_stop_with_text(char* text_out, size_t text_cap)
     s_voice.asr_stream = NULL;
     pthread_mutex_unlock(&s_voice.lock);
     int close_ret = audio_capture_close(cap);
+    agent_trace_stage(tracked ? id : 0, "capture_closed", 0, close_ret);
     if (close_ret == 0 && ret == 0) {
         notify_channel_event(VOICE_CHANNEL_EVENT_CAPTURE_QUIESCENT, 0);
         if (tracked) ret = voice_request_status(id);
@@ -1929,6 +1941,7 @@ int voice_channel_stop_with_text(char* text_out, size_t text_cap)
     } else if (ret != 0) {
         if (stream) voice_asr_stream_abort(stream);
     } else if (stream) {
+        agent_trace_stage(tracked ? id : 0, "asr_stream_finish", 0, 0);
         ret = voice_asr_stream_finish(stream, text_out, text_cap);
     } else if (!pcm || !pcm_len) {
         ret = -ENODATA;
