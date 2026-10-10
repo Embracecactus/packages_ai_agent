@@ -1057,7 +1057,7 @@ static char *voice_planning_tools(const char *tools)
     cJSON *final = cJSON_Parse("{\"name\":\"agent_finalize\","
         "\"description\":\"Finish tool planning only when you have sufficient information. "
         "Use this alone with no arguments to request a separate final answer stream. "
-        "It is optional when no tools are needed and a complete answer is available. "
+        "Choose this immediately for ordinary questions that need no tools. "
         "The next phase will deliver the final spoken answer.\","
         "\"input_schema\":{\"type\":\"object\",\"properties\":{},"
         "\"additionalProperties\":false}}");
@@ -1168,8 +1168,8 @@ static char* run_react_loop(const char* sys_prompt, cJSON* messages,
     if (msg->reply_stream && llm_final_stream_supported()) {
         planning_tools = voice_planning_tools(tools_json);
         const char suffix[] = "\nFor this voice turn, first use any necessary tools. "
-            "If no tools are needed and you can answer completely, "
-            "return the complete final answer directly. "
+            "This request chooses tools only; do not generate the answer body here. "
+            "If no tools are needed, call agent_finalize alone with {} immediately. "
             "For a tool-backed answer, wait for the required tool results, then "
             "call agent_finalize alone with {} for the final answer stream. "
             "Never call it before required tools finish. "

@@ -952,6 +952,16 @@ static int llm_chat_tools_impl(const char* system_prompt, cJSON* messages,
 
     if (tools_arr) {
         cJSON_AddItemToObject(body, "tools", tools_arr);
+        /* Voice planning chooses a tool or the explicit final-phase marker.
+         * Generating a complete ordinary answer here holds its first sentence
+         * behind the entire non-streaming response. Final content is streamed
+         * only after Agent validates the complete tool decision. Do not force
+         * this policy onto ordinary synchronous/non-voice callers. */
+        if (planning && cJSON_GetArraySize(tools_arr) > 0 &&
+            !cJSON_AddStringToObject(body, "tool_choice", "required")) {
+            cJSON_Delete(body);
+            return -ENOMEM;
+        }
     }
 
     char* post_data = cJSON_PrintUnformatted(body);
