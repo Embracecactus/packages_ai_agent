@@ -32,6 +32,11 @@ int voice_channel_start_auto(void);
 /* First local wake only: keep the same recorder through the acknowledgement. */
 int voice_channel_start_auto_wake(void);
 typedef void (*voice_channel_event_cb)(int event, int result);
+/* Optional local text consumer. It is called outside the channel owner lock
+ * after ASR succeeds: 0 leaves normal Agent dispatch intact, 1 consumes the
+ * text, and a negative errno completes the current request as an error. */
+typedef int (*voice_channel_local_text_handler)(uint64_t request_id,
+    const char *text, int (*request_status)(uint64_t));
 #define VOICE_CHANNEL_EVENT_TTS_COMPLETE 1
 #define VOICE_CHANNEL_EVENT_CAPTURE_COMPLETE 2
 #define VOICE_CHANNEL_EVENT_TURN_COMPLETE 3
@@ -54,6 +59,9 @@ typedef void (*voice_channel_event_cb)(int event, int result);
 void voice_channel_wake_ack_result(int result);
 void voice_channel_service_ready(int result);
 int voice_channel_set_event_callback(voice_channel_event_cb callback);
+/* Registration is accepted only while idle, so an active turn sees one
+ * stable handler without extending the owner lock across callback code. */
+int voice_channel_set_local_text_handler(voice_channel_local_text_handler callback);
 int voice_channel_is_idle(void);
 /* Last allocated turn identity for lifecycle logging, including after idle. */
 uint64_t voice_channel_request_id(void);
