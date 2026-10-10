@@ -952,15 +952,15 @@ static int llm_chat_tools_impl(const char* system_prompt, cJSON* messages,
 
     if (tools_arr) {
         cJSON_AddItemToObject(body, "tools", tools_arr);
-        /* Voice planning chooses a tool or the explicit final-phase marker.
-         * Generating a complete ordinary answer here holds its first sentence
-         * behind the entire non-streaming response. Final content is streamed
-         * only after Agent validates the complete tool decision. Do not force
-         * this policy onto ordinary synchronous/non-voice callers. */
-        if (planning && cJSON_GetArraySize(tools_arr) > 0 &&
-            !cJSON_AddStringToObject(body, "tool_choice", "required")) {
-            cJSON_Delete(body);
-            return -ENOMEM;
+        /* MiMo supports JSON mode but ignores non-auto tool_choice. A short
+         * completed JSON decision can confirm the final phase without first
+         * generating the entire answer. Native tools remain available. */
+        if (planning && cJSON_GetArraySize(tools_arr) > 0) {
+            cJSON *format = cJSON_AddObjectToObject(body, "response_format");
+            if (!format || !cJSON_AddStringToObject(format, "type", "json_object")) {
+                cJSON_Delete(body);
+                return -ENOMEM;
+            }
         }
     }
 
@@ -1073,12 +1073,30 @@ static int llm_chat_tools_impl(const char* system_prompt, cJSON* messages,
             return -EPROTO;
         }
         if (cJSON_IsString(content) && content->valuestring[0]) {
-            resp->text = strdup(content->valuestring);
-            if (!resp->text) {
-                cJSON_Delete(root);
-                return -ENOMEM;
+            cJSON *decision = cJSON_ParseWithOpts(content->valuestring, NULL, 1);
+            cJSON *phase = cJSON_GetObjectItemCaseSensitive(decision, "voice_phase");
+            if (phase || strstr(content->valuestring, "\"voice_phase\"")) {
+                /* Admit only the complete, exclusive routing marker. It is
+                 * never spoken or committed as an answer/history message. */
+                if (!phase || !cJSON_IsObject(decision) || cJSON_GetArraySize(decision) != 1 ||
+                    !cJSON_IsString(phase) || strcmp(phase->valuestring, "final")) {
+                    cJSON_Delete(decision);
+                    cJSON_Delete(root);
+                    return -EPROTO;
+                }
+            } else {
+                /* Preserve a complete legacy no-tool answer if a provider
+                 * does not implement the decision contract. Never stream it
+                 * before the full stop/tool batch has been validated. */
+                resp->text = strdup(content->valuestring);
+                if (!resp->text) {
+                    cJSON_Delete(decision);
+                    cJSON_Delete(root);
+                    return -ENOMEM;
+                }
+                resp->text_len = strlen(resp->text);
             }
-            resp->text_len = strlen(resp->text);
+            cJSON_Delete(decision);
         }
         resp->tool_phase_complete = true;
         cJSON_Delete(root);
