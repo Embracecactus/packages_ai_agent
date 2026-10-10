@@ -256,6 +256,7 @@ static struct {
     uint64_t request_id;
     uint64_t turn_started_ms;
     voice_channel_event_cb event_cb;
+    voice_channel_local_text_handler local_text_handler;
 } s_voice = {
     .state = VOICE_IDLE,
     .lock = PTHREAD_MUTEX_INITIALIZER,
@@ -469,6 +470,37 @@ static int voice_channel_start_internal(int automatic);
 static int voice_channel_reply_stream(uint64_t id, int event,
     const char* text, size_t length);
 
+/* The handler is product-optional. Its only ownership is accepted text; it
+ * must use request_status before committing side effects. */
+static int voice_dispatch_text(uint64_t id, const char *text)
+{
+    int ret = voice_request_status(id);
+    if (ret) return ret;
+    pthread_mutex_lock(&s_voice.lock);
+    voice_channel_local_text_handler handler = s_voice.local_text_handler;
+    pthread_mutex_unlock(&s_voice.lock);
+    if (handler) {
+        ret = handler(id, text, voice_request_status);
+        if (ret) return ret;
+        /* A handler may have declined after observing cancellation.  Do not
+         * transfer a canceled request to the Agent queue. */
+        ret = voice_request_status(id);
+        if (ret) return ret;
+    }
+    agent_msg_t msg = { 0 };
+    strncpy(msg.channel, AGENT_CHAN_VOICE, sizeof(msg.channel) - 1);
+    strncpy(msg.chat_id, "voice", sizeof(msg.chat_id) - 1);
+    msg.request_id = id;
+    msg.request_status = voice_request_status;
+    msg.request_commit = voice_request_commit;
+    msg.request_complete = voice_request_complete;
+    msg.reply_stream = voice_channel_reply_stream;
+    msg.content = strdup(text);
+    ret = msg.content ? message_bus_push_inbound(&msg) : -ENOMEM;
+    if (ret) free(msg.content);
+    return ret;
+}
+
 /* The KWS reports a detection frame, not a word-end timestamp. Keep its
  * bounded pre-roll until new PCM decides the path. This favors preserving an
  * immediate command; a long wake-word tail remains an unavoidable ambiguity. */
@@ -595,19 +627,10 @@ static void* auto_finalize_task(void* arg)
         if (waited < 0) voice_channel_cancel();
         ret = voice_channel_stop_with_text(text, sizeof(text));
     }
-    if (ret == 0) ret = voice_request_status(id);
-    if (ret == 0) {
-        agent_msg_t msg = { 0 };
-        strncpy(msg.channel, AGENT_CHAN_VOICE, sizeof(msg.channel) - 1);
-        strncpy(msg.chat_id, "voice", sizeof(msg.chat_id) - 1);
-        msg.request_id = id;
-        msg.request_status = voice_request_status;
-        msg.request_commit = voice_request_commit;
-        msg.request_complete = voice_request_complete;
-        msg.reply_stream = voice_channel_reply_stream;
-        msg.content = strdup(text);
-        ret = msg.content ? message_bus_push_inbound(&msg) : -ENOMEM;
-        if (ret != 0) free(msg.content);
+    if (ret == 0) ret = voice_dispatch_text(id, text);
+    if (ret == 1) {
+        voice_request_complete(id, 0);
+        ret = 0;
     }
     memset(text, 0, sizeof(text));
     if (ret != 0) voice_request_complete(id, ret);
@@ -1821,6 +1844,18 @@ int voice_channel_set_event_callback(voice_channel_event_cb callback)
     return 0;
 }
 
+int voice_channel_set_local_text_handler(voice_channel_local_text_handler callback)
+{
+    pthread_mutex_lock(&s_voice.lock);
+    if (s_voice.state != VOICE_IDLE || s_voice.turn_active || s_voice.tts_active) {
+        pthread_mutex_unlock(&s_voice.lock);
+        return -EBUSY;
+    }
+    s_voice.local_text_handler = callback;
+    pthread_mutex_unlock(&s_voice.lock);
+    return 0;
+}
+
 int voice_channel_stop(void)
 {
     pthread_mutex_lock(&s_voice.lock);
@@ -1838,18 +1873,10 @@ int voice_channel_stop(void)
     pthread_mutex_unlock(&s_voice.lock);
     char text[512] = {0};
     int ret = voice_channel_stop_with_text(text, sizeof(text));
-    if (!ret) {
-        agent_msg_t msg = {0};
-        strncpy(msg.channel, AGENT_CHAN_VOICE, sizeof(msg.channel) - 1);
-        strncpy(msg.chat_id, "voice", sizeof(msg.chat_id) - 1);
-        msg.request_id = id;
-        msg.request_status = voice_request_status;
-        msg.request_commit = voice_request_commit;
-        msg.request_complete = voice_request_complete;
-        msg.reply_stream = voice_channel_reply_stream;
-        msg.content = strdup(text);
-        ret = msg.content ? message_bus_push_inbound(&msg) : -ENOMEM;
-        if (ret) free(msg.content);
+    if (!ret) ret = voice_dispatch_text(id, text);
+    if (ret == 1) {
+        voice_request_complete(id, 0);
+        ret = 0;
     }
     memset(text, 0, sizeof(text));
     if (ret) voice_request_complete(id, ret);
