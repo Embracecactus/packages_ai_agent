@@ -136,6 +136,16 @@ config AI_AGENT_AUDIO_PREPROCESS
 		ec2float for NS and compexp for AGC. Requires ~150KB
 		heap on BES platforms with HiFi4 DSP.
 
+config AI_AGENT_VOICE_PLAYBACK_PRIORITY
+	int "Voice PCM consumer priority override (0 inherits)"
+	default 0
+	range 0 255
+	---help---
+		Development measurement control for the existing PCM queue consumer.
+		Does not change Agent, network, synthesis, buffer sizes or scheduling
+		policy. Keep below Media service priority. Failure to apply fails the
+		turn cleanly; runtime logs report requested and observed priority.
+
 config AI_AGENT_ADAPTIVE_ENDPOINT
 	bool "Experimental sample-clock adaptive energy endpoint"
 	default n

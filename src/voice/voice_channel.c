@@ -37,6 +37,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sched.h>
 #include <semaphore.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -1090,6 +1091,7 @@ typedef struct {
     int64_t max_gap_ms;
     unsigned int rebuffer;
     int done;
+    int prepared;
     int terminal;
     int format_ready;
     int segment_format_ready;
@@ -1116,6 +1118,33 @@ static void* tts_queue_play(void* arg)
     unsigned char pcm[TTS_QUEUE_SLICE];
     int buffering = 1;
     int started = 0;
+    struct sched_param scheduling;
+    int policy;
+    int schedule_result = pthread_getschedparam(pthread_self(), &policy, &scheduling);
+#if defined(CONFIG_AI_AGENT_VOICE_PLAYBACK_PRIORITY) && CONFIG_AI_AGENT_VOICE_PLAYBACK_PRIORITY > 0
+    /* Only the bounded PCM consumer is time-critical. Preserve its policy;
+     * network, decoding and Agent planning retain their existing priorities. */
+    if (!schedule_result) {
+        scheduling.sched_priority = CONFIG_AI_AGENT_VOICE_PLAYBACK_PRIORITY;
+        schedule_result = pthread_setschedparam(pthread_self(), policy, &scheduling);
+    }
+    agent_trace_stage(q->output->request_id, "playback_priority_set",
+        CONFIG_AI_AGENT_VOICE_PLAYBACK_PRIORITY, schedule_result);
+    if (schedule_result) {
+        atomic_store(&q->error, -schedule_result);
+    } else {
+        schedule_result = pthread_getschedparam(pthread_self(), &policy, &scheduling);
+    }
+#endif
+    /* Publish setup before exposing this queue to a synthesis producer. A
+     * failed consumer can never leave an in-flight, no-PCM request stranded. */
+    pthread_mutex_lock(&q->lock);
+    q->prepared = 1;
+    pthread_cond_broadcast(&q->changed);
+    pthread_mutex_unlock(&q->lock);
+    if (atomic_load(&q->error)) return NULL;
+    agent_trace_stage(q->output->request_id, "playback_priority",
+        schedule_result ? 0 : scheduling.sched_priority, schedule_result);
     for (;;) {
         pthread_mutex_lock(&q->lock);
         while (!q->done && !atomic_load(&q->error) &&
@@ -1255,8 +1284,15 @@ static int tts_queue_open(tts_output_t* output, tts_queue_t** queue)
     if (!ret) ret = pthread_create(&q->thread, &attr, tts_queue_play, q);
     pthread_attr_destroy(&attr);
     if (!ret) {
-        *queue = q;
-        return 0;
+        pthread_mutex_lock(&q->lock);
+        while (!q->prepared) pthread_cond_wait(&q->changed, &q->lock);
+        ret = -atomic_load(&q->error);
+        pthread_mutex_unlock(&q->lock);
+        if (!ret) {
+            *queue = q;
+            return 0;
+        }
+        pthread_join(q->thread, NULL);
     }
     pthread_cond_destroy(&q->changed);
     pthread_mutex_destroy(&q->lock);
