@@ -31,16 +31,23 @@ static const voice_tts_ops_t* s_active;
 static pthread_mutex_t s_lock = PTHREAD_MUTEX_INITIALIZER;
 static unsigned int s_busy;
 
-/* One operation per backend; resource ownership lasts through cleanup. */
-static const voice_tts_ops_t* acquire(int (*check)(void *), void *request)
+/* Legacy backends admit one operation. A stream backend may explicitly admit
+ * a bounded number of independent calls; ownership lasts through cleanup. */
+static const voice_tts_ops_t* acquire(bool stream,
+    int (*check)(void *), void *request)
 {
     const voice_tts_ops_t* ops = NULL;
     pthread_mutex_lock(&s_lock);
-    if (s_busy) {
-        errno = EBUSY;
-    } else if (!s_active) {
+    if (!s_active) {
         errno = ENODEV;
     } else {
+        unsigned int limit = stream && s_active->max_streams ?
+            s_active->max_streams : 1;
+        if (s_busy >= limit) {
+            errno = EBUSY;
+            pthread_mutex_unlock(&s_lock);
+            return NULL;
+        }
         ops = s_active;
         int ret = ops->prepare_request ? ops->prepare_request() : 0;
         if (!ret && check) ret = check(request);
@@ -161,7 +168,7 @@ int voice_tts_speak_pcm_checked(const char* text, unsigned char* pcm_out,
 {
     if (!text || !pcm_out || !pcm_len || pcm_cap == 0) return -EINVAL;
     *pcm_len = 0;
-    const voice_tts_ops_t* ops = acquire(check, request);
+    const voice_tts_ops_t* ops = acquire(false, check, request);
     if (!ops) return -errno;
     voice_tts_capabilities_t caps = {
         .batch_sample_rate = 16000, .channels = 1, .bits = 16,
@@ -190,10 +197,24 @@ int voice_tts_speak_stream_checked(const char* text, voice_tts_chunk_cb cb,
     void* user_data, int (*check)(void *), void *request)
 {
     if (!text || !cb) return -EINVAL;
-    const voice_tts_ops_t* ops = acquire(check, request);
+    const voice_tts_ops_t* ops = acquire(true, check, request);
     if (!ops) return -errno;
     int ret = ops->synthesize_stream ?
         ops->synthesize_stream(text, cb, user_data) : -ENOTSUP;
+    release();
+    return ret;
+}
+
+int voice_tts_speak_text_stream_checked(voice_tts_text_cb text_cb,
+    void* text_context, voice_tts_chunk_cb pcm_cb, void* pcm_context,
+    int (*check)(void *), void *request)
+{
+    if (!text_cb || !pcm_cb) return -EINVAL;
+    const voice_tts_ops_t* ops = acquire(true, check, request);
+    if (!ops) return -errno;
+    int ret = ops->synthesize_text_stream ?
+        ops->synthesize_text_stream(text_cb, text_context,
+            pcm_cb, pcm_context) : -ENOTSUP;
     release();
     return ret;
 }
@@ -215,6 +236,23 @@ bool voice_tts_stream_supported(void)
     bool supported = s_active && s_active->synthesize_stream;
     pthread_mutex_unlock(&s_lock);
     return supported;
+}
+
+bool voice_tts_text_stream_supported(void)
+{
+    pthread_mutex_lock(&s_lock);
+    bool supported = s_active && s_active->synthesize_text_stream;
+    pthread_mutex_unlock(&s_lock);
+    return supported;
+}
+
+unsigned int voice_tts_stream_capacity(void)
+{
+    pthread_mutex_lock(&s_lock);
+    unsigned int capacity = !s_active || !s_active->synthesize_stream ? 0 :
+        s_active->max_streams ? s_active->max_streams : 1;
+    pthread_mutex_unlock(&s_lock);
+    return capacity;
 }
 
 bool voice_tts_is_busy(void)

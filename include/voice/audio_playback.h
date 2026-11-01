@@ -25,11 +25,22 @@ extern "C" {
 /* Audio playback session handle (opaque). */
 typedef struct audio_playback audio_playback_t;
 
+/* Optional monotonic stage observer. The callback must remain bounded and
+ * must not call back into the playback owner. */
+typedef void (*audio_playback_stage_cb_t)(void* context,
+    const char* stage, int result);
+
 /* Open the playback device and configure for PCM output.
  * Returns NULL on failure. */
 audio_playback_t* audio_playback_open(const char* dev_path,
     unsigned int sample_rate, unsigned int channels,
     unsigned int bits_per_sample);
+
+/* Open with API-boundary observation for controlled latency diagnosis. */
+audio_playback_t* audio_playback_open_traced(const char* dev_path,
+    unsigned int sample_rate, unsigned int channels,
+    unsigned int bits_per_sample, audio_playback_stage_cb_t stage,
+    void* stage_context);
 
 /* Write PCM data to the playback device (blocking).
  * Returns bytes written, or negative errno on error. */

@@ -39,6 +39,15 @@ static const char* TAG = "audio_pb";
 #define PB_OPTIONS_LEN 128
 #define PB_CLOSE_RETRY_US (50 * 1000)
 #define PB_CLOSE_TIMEOUT_MS 2000u
+#define PB_MEDIA_FRAME_BYTES 2048u
+
+#ifndef CONFIG_AI_AGENT_TTS_QUEUE_PREFILL
+#define CONFIG_AI_AGENT_TTS_QUEUE_PREFILL 8192
+#endif
+
+_Static_assert(CONFIG_AI_AGENT_TTS_QUEUE_PREFILL >= PB_MEDIA_FRAME_BYTES &&
+    CONFIG_AI_AGENT_TTS_QUEUE_PREFILL % PB_MEDIA_FRAME_BYTES == 0,
+    "TTS prefill must contain whole Media frames");
 
 static pthread_mutex_t s_player_lock = PTHREAD_MUTEX_INITIALIZER;
 static int s_player_reserved;
@@ -133,9 +142,16 @@ static void playback_event(void* cookie, int event, int result, const char* extr
     }
 }
 
-audio_playback_t* audio_playback_open(const char* dev_path,
+static void playback_stage(audio_playback_stage_cb_t stage, void* context,
+    const char* name, int result)
+{
+    if (stage) stage(context, name, result);
+}
+
+audio_playback_t* audio_playback_open_traced(const char* dev_path,
     unsigned int sample_rate, unsigned int channels,
-    unsigned int bits_per_sample)
+    unsigned int bits_per_sample, audio_playback_stage_cb_t stage,
+    void* stage_context)
 {
     (void)dev_path;
     if (sample_rate == 0 || (channels != 1 && channels != 2) ||
@@ -167,7 +183,10 @@ audio_playback_t* audio_playback_open(const char* dev_path,
         free(pb);
         goto fail_reservation;
     }
+    playback_stage(stage, stage_context, "media_open_begin", 0);
     void* player = media_player_open(MEDIA_STREAM_MUSIC);
+    playback_stage(stage, stage_context, "media_open_end",
+        player ? 0 : -(errno ? errno : EIO));
     if (!player) {
         syslog(LOG_ERR, "[%s] media_player_open failed\n", TAG);
         goto fail;
@@ -178,24 +197,32 @@ audio_playback_t* audio_playback_open(const char* dev_path,
     }
 
     char opts[PB_OPTIONS_LEN];
-    /* The 16-kHz mono PCM demuxer emits 2048-byte frames. Match the
-     * voice queue's 8192-byte prefill with four Media frames; the default
-     * six-frame resume threshold would wait for another network chunk
-     * even after the application has released a full prefill. Leave other
-     * formats on the Media default until their buffering is coordinated. */
+    /* The 16-kHz mono PCM demuxer emits 2048-byte frames. Match Media's data
+     * queue to the configured voice prefill so a smaller controlled prefill
+     * is not hidden behind a larger second watermark. */
+    char queue[24] = "";
+    if (sample_rate == 16000 && channels == 1) {
+        snprintf(queue, sizeof(queue), ":datqmax=%u",
+            (unsigned int)(CONFIG_AI_AGENT_TTS_QUEUE_PREFILL /
+                           PB_MEDIA_FRAME_BYTES));
+    }
     snprintf(opts, sizeof(opts),
         "format=s%ule:sample_rate=%u:ch_layout=%s%s",
         bits_per_sample, sample_rate,
         (channels == 1) ? "mono" : "stereo",
-        (sample_rate == 16000 && channels == 1) ? ":datqmax=4" : "");
+        queue);
 
+    playback_stage(stage, stage_context, "media_prepare_call_begin", 0);
     int ret = media_player_prepare(player, NULL, opts);
+    playback_stage(stage, stage_context, "media_prepare_call_end", ret);
     if (ret < 0) {
         syslog(LOG_ERR, "[%s] prepare failed: %d\n", TAG, ret);
         goto fail;
     }
 
+    playback_stage(stage, stage_context, "media_start_call_begin", 0);
     ret = media_player_start(player);
+    playback_stage(stage, stage_context, "media_start_call_end", ret);
     if (ret < 0) {
         syslog(LOG_ERR, "[%s] start failed: %d\n", TAG, ret);
         goto fail;
@@ -206,6 +233,7 @@ audio_playback_t* audio_playback_open(const char* dev_path,
     if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
         goto fail;
     }
+    playback_stage(stage, stage_context, "media_socket_ready", 0);
     pb->bytes_per_frame = (bits_per_sample / 8) * channels;
 
     syslog(LOG_INFO, "[%s] opened (%uHz %uch %ubit)\n",
@@ -233,6 +261,14 @@ fail_reservation:
     s_player_reserved = 0;
     pthread_mutex_unlock(&s_player_lock);
     return NULL;
+}
+
+audio_playback_t* audio_playback_open(const char* dev_path,
+    unsigned int sample_rate, unsigned int channels,
+    unsigned int bits_per_sample)
+{
+    return audio_playback_open_traced(dev_path, sample_rate, channels,
+        bits_per_sample, NULL, NULL);
 }
 
 int audio_playback_write(audio_playback_t* pb, const void* buf, size_t len)

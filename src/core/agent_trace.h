@@ -60,6 +60,21 @@ typedef struct {
 /* A bounded, stateless timing ledger shared by Agent and voice ownership.
  * Stages deliberately carry only a request ID, monotonic timestamp, numeric
  * ordinal and result; no prompt, tool arguments, audio or credentials. */
+/* Optional numeric observer supplied by an engineering product adapter.
+ * It must be bounded and must not call back into the voice owner. No audio,
+ * text or backend configuration crosses this interface. Times share the AP
+ * monotonic clock. */
+extern void agent_audio_observe(uint64_t request, uint32_t kind,
+    uint64_t begin, uint64_t end, uint32_t bytes, uint32_t level)
+    __attribute__((weak));
+
+static inline void agent_trace_audio(uint64_t request, uint32_t kind,
+    uint64_t begin, uint64_t end, uint32_t bytes, uint32_t level)
+{
+    if (agent_audio_observe)
+        agent_audio_observe(request, kind, begin, end, bytes, level);
+}
+
 static inline void agent_trace_stage(uint64_t request_id, const char *stage,
     uint64_t value, int result)
 {

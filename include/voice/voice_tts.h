@@ -31,6 +31,14 @@ typedef void (*voice_tts_chunk_cb)(const unsigned char *pcm_data,
                                    int is_last,
                                    void *user_data);
 
+/* Return one stable, complete UTF-8 speech segment. A successful call either
+ * returns nonempty text with *is_last == 0, or no text with *is_last == 1.
+ * The callback may wait for an incremental LLM reply; cancellation must wake
+ * it through the caller's existing turn state. */
+typedef int (*voice_tts_text_cb)(char *text, size_t capacity,
+                                 size_t *text_len, int *is_last,
+                                 void *user_data);
+
 typedef enum {
     VOICE_TTS_LOCATION_UNSPECIFIED = 0,
     VOICE_TTS_LOCATION_DEVICE,
@@ -48,6 +56,13 @@ typedef struct {
 
 typedef struct voice_tts_ops {
     const char *name;
+
+    /* Maximum number of independent synthesize_stream calls supported by
+     * this backend. Zero keeps the legacy single-request contract. A backend
+     * advertising more than one stream must give every call independent
+     * transport, cancellation and decoder state; Media ownership remains at
+     * the caller. Batch synthesis is always serialized. */
+    unsigned int max_streams;
 
     /* Prepare the configured backend once per activation: load a model or
      * snapshot service settings. No network/credential requirement is imposed
@@ -68,6 +83,14 @@ typedef struct voice_tts_ops {
     /* Optional streaming synthesis and its native PCM sample rate. */
     int (*synthesize_stream)(const char *text, voice_tts_chunk_cb cb,
                              void *user_data);
+    /* Optional continuous-text session. The backend owns one synthesis
+     * connection while pulling ordered, complete text segments and emitting
+     * one ordered PCM stream. It must emit exactly one terminal PCM callback
+     * on success and must not retain either callback after returning. */
+    int (*synthesize_text_stream)(voice_tts_text_cb text_cb,
+                                  void *text_user_data,
+                                  voice_tts_chunk_cb pcm_cb,
+                                  void *pcm_user_data);
     /* Describe the prepared model/backend, including its actual PCM format.
      * A single-voice engine validates its model/voice binding during init. */
     int (*get_capabilities)(voice_tts_capabilities_t *caps);
@@ -119,6 +142,8 @@ int voice_tts_speak_stream(const char *text,
 
 int voice_tts_get_capabilities(voice_tts_capabilities_t *caps);
 bool voice_tts_stream_supported(void);
+bool voice_tts_text_stream_supported(void);
+unsigned int voice_tts_stream_capacity(void);
 bool voice_tts_is_busy(void);
 int voice_tts_cancel(void);
 /* Caller request checks run during the backend claim, after request reset.
@@ -128,6 +153,9 @@ int voice_tts_speak_pcm_checked(const char *text, unsigned char *pcm,
     int (*check)(void *), void *request);
 int voice_tts_speak_stream_checked(const char *text, voice_tts_chunk_cb cb,
     void *context, int (*check)(void *), void *request);
+int voice_tts_speak_text_stream_checked(voice_tts_text_cb text_cb,
+    void *text_context, voice_tts_chunk_cb pcm_cb, void *pcm_context,
+    int (*check)(void *), void *request);
 
 #ifdef __cplusplus
 }

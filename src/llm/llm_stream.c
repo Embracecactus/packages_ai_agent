@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define EVENT_LIMIT 16384u
 struct llm_final_stream {
@@ -14,6 +15,7 @@ struct llm_final_stream {
     llm_text_delta_t emit;
     void *context;
     int stopped, done, error;
+    llm_stream_stats_t stats;
 };
 
 static int valid_utf8(const unsigned char *s)
@@ -39,6 +41,12 @@ static int valid_utf8(const unsigned char *s)
 static int dispatch(struct llm_final_stream *p)
 {
     if (!p->event_size) return 0;
+    if (!p->stats.first_event_ms) {
+        struct timespec now;
+        if (clock_gettime(CLOCK_MONOTONIC, &now) == 0)
+            p->stats.first_event_ms = (uint64_t)now.tv_sec * 1000u +
+                now.tv_nsec / 1000000u;
+    }
     p->event[p->event_size] = 0;
     if (p->done) return -EPROTO;
     if (!strcmp(p->event, "[DONE]")) {
@@ -137,6 +145,8 @@ int llm_final_stream_feed(void *parser, const char *bytes, size_t length)
         if (!p->line_size) {
             p->error = dispatch(p);
             p->event_size = 0;
+        } else if (p->line[0] == ':') {
+            p->stats.comments++;
         } else if (!strncmp(p->line, "data:", 5)) {
             size_t start = p->line[5] == ' ' ? 6 : 5;
             size_t n = p->line_size - start;
@@ -157,6 +167,11 @@ int llm_final_stream_feed(void *parser, const char *bytes, size_t length)
 int llm_final_stream_complete(const llm_final_stream_t *p)
 {
     return p && p->done && !p->error && !p->line_size && !p->event_size;
+}
+
+llm_stream_stats_t llm_final_stream_stats(const llm_final_stream_t *p)
+{
+    return p->stats;
 }
 
 int llm_final_stream_finish(llm_final_stream_t *p, char **text)

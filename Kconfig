@@ -136,6 +136,71 @@ config AI_AGENT_AUDIO_PREPROCESS
 		ec2float for NS and compexp for AGC. Requires ~150KB
 		heap on BES platforms with HiFi4 DSP.
 
+config AI_AGENT_VOICE_ROUTE
+	bool "Experimental phase admission in voice answer stream"
+	default n
+	---help---
+		Admit an ordered final/tools JSON envelope in the existing answer stream.
+		Only the decoded answer string reaches synthesis. Ordinary answers use
+		one model request. Tools or invalid prefixes keep normal planning; after
+		body admission, errors abort the turn. No header, reasoning or tool delta
+		enters synthesis. Answer length, speech rate and tools remain unchanged.
+		Development evaluation only.
+
+config AI_AGENT_VOICE_STREAM_TOOLS
+	bool "Carry validated tool calls in the voice admission stream"
+	depends on AI_AGENT_VOICE_ROUTE
+	default n
+	---help---
+		Extend the experimental voice phase envelope so a tools phase carries
+		complete tool names and JSON arguments. No tool text is spoken: the
+		entire bounded envelope is validated before the existing Agent tool
+		guard and executor receive it. Tool results return through the same
+		loop, where a later final phase may stream directly to speech. Keep
+		disabled outside controlled evaluation until provider behavior and
+		device resources have been measured.
+
+config AI_AGENT_TTS_EARLY_MEDIA_PREPARE
+	bool "Prepare voice Media while first PCM is buffered"
+	default y
+	---help---
+		Open and prepare the existing sole Media playback handle after the
+		first TTS PCM format is validated, while the bounded queue continues
+		to fill to its unchanged playback watermark. Disable to restore the
+		previous serialized prepare-after-prefill behavior.
+
+config AI_AGENT_TTS_QUEUE_PREFILL
+	int "Voice TTS playback prefill bytes"
+	default 8192
+	range 2048 32768
+	---help---
+		Bytes retained before the voice PCM consumer first starts. Values
+		must be a multiple of the 2048-byte Media frame. Keep 8192 for product
+		behavior; smaller values require controlled device audio validation.
+
+config AI_AGENT_TTS_QUEUE_BYTES
+	int "Voice TTS PCM reservoir bytes"
+	default 65536
+	range 65536 524288
+	---help---
+		Capacity of the bounded PCM reservoir between the network TTS producer
+		and the sole Media consumer. The product default remains 64 KiB. A
+		larger value is useful only when a platform supplies suitable external
+		memory and device measurements show producer backpressure or sentence
+		transition starvation. It does not lower the playback prefill and cannot
+		manufacture PCM during a provider-side supply gap.
+
+config AI_AGENT_TTS_REQUEST_OVERLAP
+	bool "Prefetch one ordered follow-up TTS request"
+	default n
+	---help---
+		Allow the final-answer worker to keep at most two independent TTS
+		requests in flight when the selected backend explicitly advertises that
+		capability. The second request may prepare audio early, but its callback
+		cannot append to the sole Media queue before the previous sentence has
+		completed. Keep disabled in product configurations until real-device
+		provider, cancellation, memory and playback ordering are validated.
+
 config AI_AGENT_VOICE_PLAYBACK_PRIORITY
 	int "Voice PCM consumer priority override (0 inherits)"
 	default 0

@@ -153,9 +153,9 @@ static int final_stream_receive(void *context, const char *bytes, size_t length)
     return ret ? ret : llm_final_stream_complete(context) ? 1 : 0;
 }
 
-int llm_chat_final_stream_checked(const char *system_prompt, cJSON *messages,
+static int chat_final_stream(const char *system_prompt, cJSON *messages,
     llm_response_t *resp, llm_text_delta_t emit, void *emit_context,
-    int (*check)(void *), void *request_context)
+    int (*check)(void *), void *request_context, size_t protocol_bytes)
 {
     if (!resp) return -EINVAL;
     memset(resp, 0, sizeof(*resp));
@@ -183,17 +183,25 @@ int llm_chat_final_stream_checked(const char *system_prompt, cJSON *messages,
         !cJSON_AddBoolToObject(body, "stream", 1) ||
         !cJSON_AddNumberToObject(body, is_openai_compat_host(host) ?
             "max_completion_tokens" : "max_tokens", is_openai_compat_host(host) ?
-            AGENT_LLM_MAX_TOKENS_OPENAI : AGENT_LLM_MAX_TOKENS) ||
+            AGENT_LLM_MAX_TOKENS_OPENAI + (protocol_bytes ? 32 : 0) :
+            AGENT_LLM_MAX_TOKENS + (protocol_bytes ? 32 : 0)) ||
         !cJSON_AddStringToObject(system, "role", "system") ||
         !cJSON_AddStringToObject(system, "content", system_prompt)) {
         ret = -ENOMEM; goto done;
+    }
+    if (protocol_bytes) {
+        cJSON *format = cJSON_AddObjectToObject(body, "response_format");
+        if (!format || !cJSON_AddStringToObject(format, "type", "json_object")) {
+            ret = -ENOMEM; goto done;
+        }
     }
     if (!cJSON_InsertItemInArray(msgs, 0, system)) { ret = -ENOMEM; goto done; }
     system = NULL;
     if (!cJSON_AddItemToObject(body, "messages", msgs)) { ret = -ENOMEM; goto done; }
     msgs = NULL;
     request = cJSON_PrintUnformatted(body);
-    parser = llm_final_stream_new(emit, emit_context, AGENT_LLM_MAX_RESP_SIZE - 1);
+    parser = llm_final_stream_new(emit, emit_context,
+        AGENT_LLM_MAX_RESP_SIZE - 1 + protocol_bytes);
     if (!request || !parser) { ret = -ENOMEM; goto done; }
     int status = 0;
     ret = transport(request, final_stream_receive, parser, &status, context,
@@ -202,8 +210,11 @@ int llm_chat_final_stream_checked(const char *system_prompt, cJSON *messages,
     if (!ret && check) ret = check(request_context);
     if (!ret) ret = llm_final_stream_finish(parser, &resp->text);
     if (!ret) resp->text_len = strlen(resp->text);
-    syslog(LOG_INFO, "[%s] final SSE status=%d result=%d text_bytes=%zu\n",
-           TAG, status, ret, resp->text_len);
+    llm_stream_stats_t stats = llm_final_stream_stats(parser);
+    syslog(LOG_INFO, "[%s] final SSE status=%d result=%d text_bytes=%zu "
+           "first_sse_ms=%llu comments=%zu\n", TAG, status, ret,
+           resp->text_len, (unsigned long long)stats.first_event_ms,
+           stats.comments);
 done:
     llm_final_stream_free(parser);
     if (request) { memset(request, 0, strlen(request)); free(request); }
@@ -212,6 +223,386 @@ done:
     s_transport_users--;
     pthread_mutex_unlock(&s_llm_lock);
     return ret;
+}
+
+int llm_chat_final_stream_checked(const char *system_prompt, cJSON *messages,
+    llm_response_t *resp, llm_text_delta_t emit, void *emit_context,
+    int (*check)(void *), void *request_context)
+{
+    return chat_final_stream(system_prompt, messages, resp, emit, emit_context,
+                             check, request_context, 0);
+}
+
+/* The existing SSE decoder owns transport/framing. This adapter admits only
+ * an ordered JSON envelope, and decodes only its final answer string. */
+struct voice_phase_stream {
+    char header[192];
+    size_t used, body_bytes, tool_bytes;
+    unsigned state, hex_digits, codepoint, high_surrogate;
+    bool quoted, decided, final, calls_allowed;
+    bool first_content, first_tool_fragment;
+    llm_text_delta_t emit;
+    int (*phase)(void *, bool);
+    llm_voice_stream_event_t event;
+    void *context;
+};
+
+enum voice_json_state {
+    VJ_HEADER, VJ_BODY, VJ_ESCAPE, VJ_HEX, VJ_LOW_SLASH, VJ_LOW_U,
+    VJ_END, VJ_TOOLS, VJ_DONE
+};
+
+#define VOICE_STREAM_TOOL_BYTES_MAX (16 * 1024)
+#define VOICE_STREAM_TOOL_ARGS_MAX (8 * 1024)
+
+static bool voice_json_space(unsigned char c)
+{
+    return c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+static int voice_stream_event(struct voice_phase_stream *s,
+    enum llm_voice_stream_event_e event, size_t value)
+{
+    return s->event ? s->event(s->context, event, value) : 0;
+}
+
+static int voice_json_output(struct voice_phase_stream *s, char *out,
+    size_t *used, const char *text, size_t length)
+{
+    if (length > AGENT_LLM_MAX_RESP_SIZE - 1 - s->body_bytes) return -E2BIG;
+    if (*used + length > 256) {
+        int ret = s->emit ? s->emit(s->context, out, *used) : 0;
+        if (ret) return ret;
+        *used = 0;
+    }
+    memcpy(out + *used, text, length);
+    *used += length;
+    s->body_bytes += length;
+    return 0;
+}
+
+static int voice_phase_delta(void *context, const char *text, size_t length)
+{
+    struct voice_phase_stream *s = context;
+    static const char final[] = "{\"voice_phase\":\"final\",\"answer\":\"";
+    static const char tools[] = "{\"voice_phase\":\"tools\"}";
+    static const char tool_calls[] =
+        "{\"voice_phase\":\"tools\",\"calls\":[";
+    char out[256];
+    size_t used = 0;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char)text[i];
+        char decoded[4];
+        size_t n = 0;
+        int ret;
+        switch (s->state) {
+        case VJ_HEADER:
+            if (!s->quoted && voice_json_space(c)) continue;
+            if (!s->first_content) {
+                s->first_content = true;
+                ret = voice_stream_event(s,
+                    LLM_VOICE_STREAM_FIRST_CONTENT, 1);
+                if (ret) return ret;
+            }
+            if (s->used + 1 >= sizeof(s->header)) return -E2BIG;
+            s->header[s->used++] = c;
+            s->header[s->used] = 0;
+            if (c == '"') s->quoted = !s->quoted;
+            bool final_prefix = !strncmp(final, s->header, s->used);
+            bool tools_prefix = s->calls_allowed ?
+                !strncmp(tool_calls, s->header, s->used) :
+                !strncmp(tools, s->header, s->used);
+            if (!final_prefix && !tools_prefix) return -EPROTO;
+            bool final_complete = !strcmp(s->header, final);
+            bool tools_complete = s->calls_allowed ?
+                !strcmp(s->header, tool_calls) : !strcmp(s->header, tools);
+            if (final_complete || tools_complete) {
+                s->decided = true;
+                s->final = final_complete;
+                s->state = s->final ? VJ_BODY :
+                    (s->calls_allowed ? VJ_TOOLS : VJ_DONE);
+                ret = s->phase ? s->phase(s->context, s->final) : 0;
+                if (ret) return ret;
+                ret = voice_stream_event(s, s->final ?
+                    LLM_VOICE_STREAM_PHASE_FINAL :
+                    LLM_VOICE_STREAM_PHASE_TOOLS, 1);
+                if (ret) return ret;
+            }
+            continue;
+        case VJ_BODY:
+            if (c == '"') { s->state = VJ_END; continue; }
+            if (c == '\\') { s->state = VJ_ESCAPE; continue; }
+            if (c < 0x20) return -EPROTO;
+            decoded[n++] = c;
+            break;
+        case VJ_ESCAPE:
+            s->state = VJ_BODY;
+            switch (c) {
+            case '"': case '\\': case '/': decoded[n++] = c; break;
+            case 'b': decoded[n++] = '\b'; break;
+            case 'f': decoded[n++] = '\f'; break;
+            case 'n': decoded[n++] = '\n'; break;
+            case 'r': decoded[n++] = '\r'; break;
+            case 't': decoded[n++] = '\t'; break;
+            case 'u':
+                s->state = VJ_HEX;
+                s->hex_digits = s->codepoint = 0;
+                continue;
+            default: return -EPROTO;
+            }
+            break;
+        case VJ_LOW_SLASH:
+            if (c != '\\') return -EPROTO;
+            s->state = VJ_LOW_U;
+            continue;
+        case VJ_LOW_U:
+            if (c != 'u') return -EPROTO;
+            s->state = VJ_HEX;
+            s->hex_digits = s->codepoint = 0;
+            continue;
+        case VJ_HEX: {
+            unsigned digit;
+            if (c >= '0' && c <= '9') digit = c - '0';
+            else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+            else if (c >= 'A' && c <= 'F') digit = c - 'A' + 10;
+            else return -EPROTO;
+            s->codepoint = s->codepoint * 16 + digit;
+            if (++s->hex_digits != 4) continue;
+            unsigned cp = s->codepoint;
+            if (s->high_surrogate) {
+                if (cp < 0xdc00 || cp > 0xdfff) return -EPROTO;
+                cp = 0x10000 + ((s->high_surrogate - 0xd800) << 10) +
+                    cp - 0xdc00;
+                s->high_surrogate = 0;
+            } else if (cp >= 0xd800 && cp <= 0xdbff) {
+                s->high_surrogate = cp;
+                s->state = VJ_LOW_SLASH;
+                continue;
+            } else if (!cp || (cp >= 0xdc00 && cp <= 0xdfff)) {
+                return -EPROTO;
+            }
+            if (cp < 0x80) decoded[n++] = cp;
+            else if (cp < 0x800) {
+                decoded[n++] = 0xc0 | (cp >> 6);
+                decoded[n++] = 0x80 | (cp & 63);
+            } else if (cp < 0x10000) {
+                decoded[n++] = 0xe0 | (cp >> 12);
+                decoded[n++] = 0x80 | ((cp >> 6) & 63);
+                decoded[n++] = 0x80 | (cp & 63);
+            } else {
+                decoded[n++] = 0xf0 | (cp >> 18);
+                decoded[n++] = 0x80 | ((cp >> 12) & 63);
+                decoded[n++] = 0x80 | ((cp >> 6) & 63);
+                decoded[n++] = 0x80 | (cp & 63);
+            }
+            s->state = VJ_BODY;
+            break;
+        }
+        case VJ_END:
+            if (voice_json_space(c)) continue;
+            if (c != '}') return -EPROTO;
+            s->state = VJ_DONE;
+            continue;
+        case VJ_TOOLS:
+            if (!s->first_tool_fragment) {
+                s->first_tool_fragment = true;
+                ret = voice_stream_event(s,
+                    LLM_VOICE_STREAM_TOOL_FRAGMENT, 1);
+                if (ret) return ret;
+            }
+            if (++s->tool_bytes > VOICE_STREAM_TOOL_BYTES_MAX)
+                return -E2BIG;
+            continue;
+        case VJ_DONE:
+            if (!voice_json_space(c)) return -EPROTO;
+            continue;
+        default:
+            return -EPROTO;
+        }
+        ret = voice_json_output(s, out, &used, decoded, n);
+        if (ret) return ret;
+    }
+    return used && s->emit ? s->emit(s->context, out, used) : 0;
+}
+
+static bool voice_tool_token_valid(const char *text, size_t capacity)
+{
+    size_t length = text ? strlen(text) : 0;
+    if (!length || length >= capacity) return false;
+    for (size_t i = 0; i < length; i++) {
+        unsigned char c = (unsigned char)text[i];
+        if (c < 0x21 || c > 0x7e) return false;
+    }
+    return true;
+}
+
+static int voice_stream_parse_tools(llm_response_t *resp)
+{
+    int ret = -EPROTO;
+    cJSON *envelope = cJSON_ParseWithOpts(resp->text, NULL, 1);
+    cJSON *phase = cJSON_GetObjectItemCaseSensitive(envelope, "voice_phase");
+    cJSON *calls = cJSON_GetObjectItemCaseSensitive(envelope, "calls");
+    cJSON *first = envelope ? envelope->child : NULL;
+    if (!cJSON_IsObject(envelope) || cJSON_GetArraySize(envelope) != 2 ||
+        !first || !first->string || strcmp(first->string, "voice_phase") ||
+        !first->next || !first->next->string ||
+        strcmp(first->next->string, "calls") ||
+        !cJSON_IsString(phase) || strcmp(phase->valuestring, "tools") ||
+        !cJSON_IsArray(calls)) goto done;
+    int count = cJSON_GetArraySize(calls);
+    if (count < 1 || count > AGENT_MAX_TOOL_CALLS) goto done;
+
+    cJSON *item = NULL;
+    cJSON_ArrayForEach(item, calls) {
+        cJSON *field = item ? item->child : NULL;
+        cJSON *id = cJSON_GetObjectItemCaseSensitive(item, "id");
+        cJSON *name = cJSON_GetObjectItemCaseSensitive(item, "name");
+        cJSON *arguments = cJSON_GetObjectItemCaseSensitive(item, "arguments");
+        if (!cJSON_IsObject(item) || cJSON_GetArraySize(item) != 3 ||
+            !field || !field->string || strcmp(field->string, "id") ||
+            !field->next || !field->next->string ||
+            strcmp(field->next->string, "name") ||
+            !field->next->next || !field->next->next->string ||
+            strcmp(field->next->next->string, "arguments") ||
+            !cJSON_IsString(id) || !cJSON_IsString(name) ||
+            !cJSON_IsObject(arguments) ||
+            !voice_tool_token_valid(id->valuestring,
+                sizeof(resp->calls[0].id)) ||
+            !voice_tool_token_valid(name->valuestring,
+                sizeof(resp->calls[0].name))) goto done;
+        for (int i = 0; i < resp->call_count; i++) {
+            if (!strcmp(resp->calls[i].id, id->valuestring)) goto done;
+        }
+        char *input = cJSON_PrintUnformatted(arguments);
+        if (!input) { ret = -ENOMEM; goto done; }
+        size_t input_len = strlen(input);
+        if (input_len > VOICE_STREAM_TOOL_ARGS_MAX) {
+            free(input);
+            ret = -E2BIG;
+            goto done;
+        }
+        llm_tool_call_t *call = &resp->calls[resp->call_count];
+        memcpy(call->id, id->valuestring, strlen(id->valuestring) + 1);
+        memcpy(call->name, name->valuestring, strlen(name->valuestring) + 1);
+        call->input = input;
+        call->input_len = input_len;
+        resp->call_count++;
+    }
+    resp->tool_use = true;
+    resp->tool_phase_complete = true;
+    ret = 0;
+done:
+    cJSON_Delete(envelope);
+    if (ret) {
+        llm_response_free(resp);
+        memset(resp, 0, sizeof(*resp));
+    } else {
+        free(resp->text);
+        resp->text = NULL;
+        resp->text_len = 0;
+    }
+    return ret;
+}
+
+static int voice_stream_finish(struct voice_phase_stream *s,
+    llm_response_t *resp)
+{
+    int ret = 0;
+    if (!s->decided || (s->final &&
+        (s->state != VJ_DONE || !s->body_bytes)) ||
+        (!s->final && !s->calls_allowed && s->state != VJ_DONE) ||
+        (!s->final && s->calls_allowed &&
+         (s->state != VJ_TOOLS || !s->tool_bytes))) return -EPROTO;
+    if (s->final) {
+        cJSON *envelope = cJSON_ParseWithOpts(resp->text, NULL, 1);
+        cJSON *answer = cJSON_GetObjectItemCaseSensitive(envelope, "answer");
+        cJSON *phase = cJSON_GetObjectItemCaseSensitive(envelope,
+            "voice_phase");
+        cJSON *first = envelope ? envelope->child : NULL;
+        if (!cJSON_IsObject(envelope) ||
+            cJSON_GetArraySize(envelope) != 2 || !first ||
+            !first->string || strcmp(first->string, "voice_phase") ||
+            !first->next || !first->next->string ||
+            strcmp(first->next->string, "answer") ||
+            !cJSON_IsString(phase) || strcmp(phase->valuestring, "final") ||
+            !cJSON_IsString(answer) ||
+            strlen(answer->valuestring) != s->body_bytes) {
+            ret = -EPROTO;
+        } else {
+            memcpy(resp->text, answer->valuestring, s->body_bytes + 1);
+            resp->text_len = s->body_bytes;
+            resp->tool_phase_complete = true;
+        }
+        cJSON_Delete(envelope);
+    } else if (s->calls_allowed) {
+        ret = voice_stream_parse_tools(resp);
+    } else {
+        free(resp->text);
+        resp->text = NULL;
+        resp->text_len = 0;
+    }
+    return ret;
+}
+
+static int voice_stream_log_result(struct voice_phase_stream *s,
+    llm_response_t *resp, int ret)
+{
+    if (ret) {
+        /* Classify only known protocol-key initials, never response text. */
+        unsigned key_initial = s->used >= 3 && s->header[0] == '{' &&
+            s->header[1] == '"' && strchr("act\\", s->header[2]) ?
+            (unsigned char)s->header[2] : 0;
+        syslog(LOG_WARNING,
+            "[%s] voice admission result=%d header_bytes=%zu "
+            "decided=%d body_bytes=%zu tool_bytes=%zu state=%u "
+            "key_initial=%u\n",
+            TAG, ret, s->used, s->decided, s->body_bytes,
+            s->tool_bytes, s->state, key_initial);
+    }
+    if (ret) {
+        llm_response_free(resp);
+        memset(resp, 0, sizeof(*resp));
+    } else if (!s->final && !s->calls_allowed) {
+        free(resp->text);
+        resp->text = NULL;
+        resp->text_len = 0;
+    }
+    return ret;
+}
+
+int llm_chat_voice_stream_checked(const char *system_prompt, cJSON *messages,
+    llm_response_t *resp, llm_text_delta_t emit,
+    int (*phase)(void *, bool), void *emit_context,
+    int (*check)(void *), void *request_context)
+{
+    if (!resp) return -EINVAL;
+    struct voice_phase_stream s = {
+        .emit = emit,
+        .phase = phase,
+        .context = emit_context,
+    };
+    int ret = chat_final_stream(system_prompt, messages, resp,
+        voice_phase_delta, &s, check, request_context, sizeof(s.header));
+    if (!ret) ret = voice_stream_finish(&s, resp);
+    return voice_stream_log_result(&s, resp, ret);
+}
+
+int llm_chat_voice_plan_stream_checked(const char *system_prompt,
+    cJSON *messages, llm_response_t *resp, llm_text_delta_t emit,
+    llm_voice_stream_event_t event, void *emit_context,
+    int (*check)(void *), void *request_context)
+{
+    if (!resp) return -EINVAL;
+    struct voice_phase_stream s = {
+        .calls_allowed = true,
+        .emit = emit,
+        .event = event,
+        .context = emit_context,
+    };
+    int ret = chat_final_stream(system_prompt, messages, resp,
+        voice_phase_delta, &s, check, request_context, sizeof(s.header));
+    if (!ret) ret = voice_stream_finish(&s, resp);
+    return voice_stream_log_result(&s, resp, ret);
 }
 
 int resp_buf_init(resp_buf_t* rb, size_t initial_cap)
@@ -952,16 +1343,9 @@ static int llm_chat_tools_impl(const char* system_prompt, cJSON* messages,
 
     if (tools_arr) {
         cJSON_AddItemToObject(body, "tools", tools_arr);
-        /* MiMo supports JSON mode but ignores non-auto tool_choice. A short
-         * completed JSON decision can confirm the final phase without first
-         * generating the entire answer. Native tools remain available. */
-        if (planning && cJSON_GetArraySize(tools_arr) > 0) {
-            cJSON *format = cJSON_AddObjectToObject(body, "response_format");
-            if (!format || !cJSON_AddStringToObject(format, "type", "json_object")) {
-                cJSON_Delete(body);
-                return -ENOMEM;
-            }
-        }
+        /* Keep native tool decisions native. JSON mode constrains content,
+         * not the tool-call envelope, and can produce mixed planning objects
+         * instead of an early agent_finalize call. */
     }
 
     char* post_data = cJSON_PrintUnformatted(body);
@@ -1073,8 +1457,12 @@ static int llm_chat_tools_impl(const char* system_prompt, cJSON* messages,
             return -EPROTO;
         }
         if (cJSON_IsString(content) && content->valuestring[0]) {
+            const char *start = content->valuestring;
+            while (*start && strchr(" \t\r\n", *start)) start++;
             cJSON *decision = cJSON_ParseWithOpts(content->valuestring, NULL, 1);
             cJSON *phase = cJSON_GetObjectItemCaseSensitive(decision, "voice_phase");
+            bool structured = *start == '{' || *start == '[' ||
+                              !strncmp(start, "```", 3);
             if (phase || strstr(content->valuestring, "\"voice_phase\"")) {
                 /* Admit only the complete, exclusive routing marker. It is
                  * never spoken or committed as an answer/history message. */
@@ -1084,6 +1472,13 @@ static int llm_chat_tools_impl(const char* system_prompt, cJSON* messages,
                     cJSON_Delete(root);
                     return -EPROTO;
                 }
+            } else if (structured) {
+                /* Structured content can contain tool arguments or a draft.
+                 * A complete HTTP response does not turn that object into a
+                 * spoken answer. */
+                cJSON_Delete(decision);
+                cJSON_Delete(root);
+                return -EPROTO;
             } else {
                 /* Preserve a complete legacy no-tool answer if a provider
                  * does not implement the decision contract. Never stream it

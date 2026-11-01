@@ -125,6 +125,35 @@ int llm_chat_final_stream_checked(const char *system_prompt, cJSON *messages,
     llm_response_t *resp, llm_text_delta_t emit, void *emit_context,
     int (*check)(void *), void *request_context);
 
+/* One stream admits an ordered final/tools JSON envelope. Only decoded answer
+ * deltas reach emit; no tools are requested or executed. A successful tools
+ * decision has no text and tool_phase_complete=false. After any emitted body,
+ * callers must abort errors/cancellation rather than fall back to tools. */
+int llm_chat_voice_stream_checked(const char *system_prompt, cJSON *messages,
+    llm_response_t *resp, llm_text_delta_t emit,
+    int (*phase)(void *, bool), void *emit_context,
+    int (*check)(void *), void *request_context);
+
+enum llm_voice_stream_event_e {
+    LLM_VOICE_STREAM_FIRST_CONTENT = 1,
+    LLM_VOICE_STREAM_PHASE_FINAL,
+    LLM_VOICE_STREAM_PHASE_TOOLS,
+    LLM_VOICE_STREAM_TOOL_FRAGMENT,
+};
+
+typedef int (*llm_voice_stream_event_t)(void *context,
+    enum llm_voice_stream_event_e event, size_t value);
+
+/* Tool-capable form of the ordered voice envelope. A final phase has the
+ * same streaming answer contract as llm_chat_voice_stream_checked(). A tools
+ * phase is retained in bounded storage and admitted only after the complete
+ * object, IDs, names and JSON argument objects validate. It never calls or
+ * authorizes a tool itself. */
+int llm_chat_voice_plan_stream_checked(const char *system_prompt,
+    cJSON *messages, llm_response_t *resp, llm_text_delta_t emit,
+    llm_voice_stream_event_t event, void *emit_context,
+    int (*check)(void *), void *request_context);
+
 /** Vision chat: send text + base64 image to a vision-capable model.
  *  image_b64 is the raw base64 string (no data: prefix).
  *  mime_type: "image/jpeg", "image/png", etc. NULL defaults to "image/jpeg". */

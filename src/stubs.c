@@ -17,7 +17,9 @@
 #include <nuttx/config.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <sys/types.h>
+#include "voice/voice_channel.h"
 
 /* Stubs to fix link errors in a broken defconfig */
 
@@ -32,6 +34,34 @@ __attribute__((weak)) pid_t gettid(void) { return 0; }
 #endif
 
 __attribute__((weak)) void arm_netinitialize(void) { }
+
+__attribute__((weak)) void *voice_channel_tts_reservoir_alloc(
+    size_t preferred_size, size_t minimum_size, size_t *allocated_size)
+{
+    if (!allocated_size || !minimum_size || minimum_size > preferred_size)
+        return NULL;
+    void *memory = malloc(preferred_size);
+    if (memory) {
+        *allocated_size = preferred_size;
+        return memory;
+    }
+    if (minimum_size == preferred_size) return NULL;
+    memory = malloc(minimum_size);
+    if (memory) *allocated_size = minimum_size;
+    return memory;
+}
+
+__attribute__((weak)) void voice_channel_tts_reservoir_free(void *memory)
+{
+    free(memory);
+}
+
+__attribute__((weak)) int voice_channel_tts_reservoir_storage(
+    const void *memory)
+{
+    (void)memory;
+    return VOICE_CHANNEL_TTS_STORAGE_NORMAL;
+}
 
 /* Voice channel stubs for sim build */
 #ifndef CONFIG_MEDIA
