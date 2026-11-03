@@ -1119,7 +1119,7 @@ static int tts_output_prepare(tts_output_t* out)
     if (ret) return ret;
     pthread_mutex_lock(&s_voice.lock);
     s_voice.tts_pb = out->pb;
-    if (s_voice.tts_abort) audio_playback_stop(out->pb);
+    if (s_voice.tts_abort) audio_playback_request_stop(out->pb);
     pthread_mutex_unlock(&s_voice.lock);
     return 0;
 }
@@ -1947,7 +1947,8 @@ static int voice_channel_start_internal(int automatic)
         syslog(LOG_INFO,
             "[%s] PTT: stopping active TTS to prevent echo\n", TAG);
         s_voice.tts_abort = 1;
-        if (s_voice.tts_pb) audio_playback_stop(s_voice.tts_pb);
+        if (s_voice.tts_pb) audio_playback_request_stop(s_voice.tts_pb);
+        pthread_mutex_unlock(&s_voice.lock);
         int canceled = voice_tts_cancel();
         if (canceled < 0)
             syslog(LOG_WARNING, "[%s] TTS cancel unavailable: %d\n", TAG, canceled);
@@ -1959,8 +1960,6 @@ static int voice_channel_start_internal(int automatic)
          * device stays open while we open the capture device, and on
          * BES hardware the shared codec (ci2s) gets confused, causing
          * incomplete or corrupted recording. */
-        pthread_mutex_unlock(&s_voice.lock);
-
         /* Wait for the speak thread to finish — speak_lock is held
          * for the entire duration of voice_channel_speak(). */
         pthread_mutex_lock(&s_voice.speak_lock);
@@ -2206,8 +2205,8 @@ int voice_channel_cancel(void)
     s_voice.canceled = 1;
     s_voice.wake_ack_pending = 0;
     s_voice.tts_abort = 1;
-    if (s_voice.cap) audio_capture_abort(s_voice.cap);
-    if (s_voice.tts_pb) audio_playback_stop(s_voice.tts_pb);
+    if (s_voice.cap) audio_capture_request_abort(s_voice.cap);
+    if (s_voice.tts_pb) audio_playback_request_stop(s_voice.tts_pb);
     pthread_mutex_unlock(&s_voice.lock);
     notify_channel_event(VOICE_CHANNEL_EVENT_WAKE_ACK_CANCEL, 0);
     reply_wake();
@@ -2349,10 +2348,11 @@ int voice_channel_stop_with_text(char* text_out, size_t text_cap)
     agent_trace_stage(s_voice.turn_active ? s_voice.request_id : 0,
         "endpoint_end", 0, 0);
     audio_capture_t *cap = s_voice.cap;
-    /* Cancellation borrows cap under this same owner lock. Serialize abort
-     * until its producer join completes; two concurrent joins are undefined. */
-    audio_capture_abort(cap);
+    /* Publish cancellation while cap is protected, then let the sole owner
+     * join the producer and stop Media without blocking channel state. */
+    audio_capture_request_abort(cap);
     pthread_mutex_unlock(&s_voice.lock);
+    audio_capture_abort(cap);
     pthread_join(s_voice.rec_thread, NULL);
     pthread_mutex_lock(&s_voice.lock);
     /* The recording worker has joined. Detach before close can free cap,
@@ -2782,7 +2782,8 @@ static int voice_channel_reply_stream(uint64_t id, int event,
     if (event == AGENT_REPLY_ABORT) {
         pthread_mutex_lock(&s_voice.lock);
         atomic_store(&s_voice.tts_abort, 1);
-        if (s_voice.tts_pb) audio_playback_stop(s_voice.tts_pb);
+        if (s_voice.tts_pb)
+            audio_playback_request_stop(s_voice.tts_pb);
         pthread_mutex_unlock(&s_voice.lock);
         voice_tts_cancel();
     }
@@ -2810,6 +2811,7 @@ int voice_channel_speak(const char* text)
     /* If another thread is already speaking, abort its TTS playback
      * so we don't overlap media_player sessions (which causes the
      * media framework to attempt a ~1.3GB allocation and crash). */
+    int cancel_previous = 0;
     pthread_mutex_lock(&s_voice.lock);
     if (s_voice.reply_stream_active) {
         pthread_mutex_unlock(&s_voice.lock);
@@ -2818,12 +2820,16 @@ int voice_channel_speak(const char* text)
     if (s_voice.tts_active) {
         syslog(LOG_INFO, "[%s] speak: aborting previous TTS\n", TAG);
         s_voice.tts_abort = 1;
-        if (s_voice.tts_pb) audio_playback_stop(s_voice.tts_pb);
+        if (s_voice.tts_pb)
+            audio_playback_request_stop(s_voice.tts_pb);
+        cancel_previous = 1;
+    }
+    pthread_mutex_unlock(&s_voice.lock);
+    if (cancel_previous) {
         int canceled = voice_tts_cancel();
         if (canceled < 0)
             syslog(LOG_WARNING, "[%s] TTS cancel unavailable: %d\n", TAG, canceled);
     }
-    pthread_mutex_unlock(&s_voice.lock);
 
     pthread_mutex_lock(&s_voice.speak_lock);
 

@@ -47,6 +47,10 @@ audio_playback_t* audio_playback_open_traced(const char* dev_path,
 int audio_playback_write(audio_playback_t* pb,
     const void* buf, size_t len);
 
+/* Publish cancellation to writers/drainers without invoking Media control.
+ * The sole playback owner remains responsible for stop/close. */
+void audio_playback_request_stop(audio_playback_t* pb);
+
 /* Force-stop an active playback from another thread.
  * Stops the underlying media_player and marks the handle so that
  * subsequent write() calls return -ECANCELED immediately.

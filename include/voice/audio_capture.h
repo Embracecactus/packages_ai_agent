@@ -95,7 +95,12 @@ int audio_capture_start(audio_capture_t *cap);
 int audio_capture_read(audio_capture_t *cap,
     void *buf, size_t len);
 
-/* Interrupt any in-flight blocking read without freeing the handle. */
+/* Request cancellation without joining the producer or invoking backend
+ * control. The sole owner must still call audio_capture_abort()/close(). */
+int audio_capture_request_abort(audio_capture_t *cap);
+
+/* Interrupt any in-flight blocking read and quiesce the backend without
+ * freeing the handle. This may wait for the bounded producer poll. */
 int audio_capture_abort(audio_capture_t* cap);
 
 /* Stop recording and release all resources. A negative result means the

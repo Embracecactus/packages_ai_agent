@@ -1225,16 +1225,31 @@ int audio_capture_set_discard(audio_capture_t *cap, int discard)
     return ret;
 }
 
-int audio_capture_abort(audio_capture_t* cap)
+int audio_capture_request_abort(audio_capture_t *cap)
 {
     if (!cap) {
         return -EINVAL;
     }
+
+    atomic_store(&cap->abort_requested, true);
     if (cap->ring) {
         pthread_mutex_lock(&cap->lock);
         cap->stopping = 1;
         pthread_cond_broadcast(&cap->ready);
         pthread_mutex_unlock(&cap->lock);
+    }
+
+    return 0;
+}
+
+int audio_capture_abort(audio_capture_t* cap)
+{
+    int request_ret = audio_capture_request_abort(cap);
+
+    if (request_ret < 0) {
+        return request_ret;
+    }
+    if (cap->ring) {
         /* This reader polls at 100 ms and is the socket's sole consumer.
          * Join before invoking recorder control or releasing its socket. */
         if (cap->producer_valid) {
@@ -1262,7 +1277,6 @@ int audio_capture_abort(audio_capture_t* cap)
             /* Ring mode has already joined its sole producer above. In
              * direct mode, prevent a new read and await the bounded existing
              * poll/read before invoking Media's socket-closing controls. */
-            atomic_store(&cap->abort_requested, true);
             if (!cap->ring) pthread_mutex_lock(&cap->io_lock);
 #ifdef CONFIG_MEDIA_GRAPH
             media_recorder_close_socket(cap->handle.recorder);

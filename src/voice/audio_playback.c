@@ -377,11 +377,18 @@ int audio_playback_drain(audio_playback_t* pb, unsigned int timeout_ms)
     return atomic_load(&pb->result);
 }
 
-void audio_playback_stop(audio_playback_t* pb)
+void audio_playback_request_stop(audio_playback_t* pb)
 {
     if (pb) {
         atomic_store(&pb->stopped, 1);
         sem_post(&pb->completion);
+    }
+}
+
+void audio_playback_stop(audio_playback_t* pb)
+{
+    if (pb) {
+        audio_playback_request_stop(pb);
         if (pb->player) {
             media_player_stop(pb->player);
         }
